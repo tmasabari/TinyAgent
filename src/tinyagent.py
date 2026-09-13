@@ -194,11 +194,10 @@ class TinyAgent:
     def _data(self, source: str, query: str) -> Any:
         payload = {"source": source, "query": query}
         self._event("ContextRequested", **payload)
-        decisions = _hook_before(self.hooks, "get_data", payload)
-        for decision in decisions:
+        for decision in _hook_before(self.hooks, "get_data", payload):
             if decision is not None:
                 self._event("ContextCacheHit", **payload)
-                return decision
+                return payload.get("result", decision)
         result = self.get_data(source, query)
         result = _hook_after(self.hooks, "get_data", payload, result)
         self._event("ContextRetrieved", **payload)
@@ -230,6 +229,8 @@ class TinyAgent:
                 "reason": requirement.reason,
             })
 
+        # Keep stable prompt material before the changing runtime block so provider
+        # prefix/KV caches can reuse the longest possible prefix.
         system = SYSTEM_PROMPT + "\n" + runtime_prompt(self.runtime)
         for _ in range(self.max_iterations):
             self._event("ModelRequested")
