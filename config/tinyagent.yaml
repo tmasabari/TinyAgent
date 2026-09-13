@@ -1,0 +1,100 @@
+# Functional controls, model profiles and NFR defaults.
+# Runtime facts (time, OS, cwd, knowledge cutoff) are supplied by the host.
+
+agent:
+  max_iterations: 8
+
+preflight:
+  current_words:
+    - latest
+    - current
+    - today
+    - now
+    - recent
+    - recently
+    - newest
+    - updated
+    - currently
+    - this week
+    - this month
+  file_phrases:
+    - my code
+    - my project
+    - this file
+    - repository
+    - repo
+    - codebase
+    - local config
+    - local logs
+  domain_words:
+    - github
+    - jira
+    - azure
+    - aws
+    - deployment
+    - production
+    - logs
+    - metrics
+    - monitoring
+    - ticket
+    - issue
+    - pull request
+    - branch
+    - commit
+    - resource group
+    - lambda
+    - ec2
+    - cloudwatch
+    - database
+    - database state
+    - environment
+  state_words:
+    - my
+    - our
+    - this
+    - status
+    - running
+    - deployed
+    - configured
+    - failed
+    - failure
+    - logs
+    - metrics
+    - production
+    - environment
+
+models:
+  ling-3.0-tiny:
+    model: inclusionAI/Ling-3.0-tiny
+    base_url: http://127.0.0.1:8000/v1
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    max_tokens: 2048
+    thinking: true
+    tool_call_parser: ling3
+    reasoning_parser: ling3
+    prefix_cache: true
+
+  ornith-1.5-9b:
+    model: ornith-ai/Ornith-1.5-9B
+    base_url: http://127.0.0.1:8000/v1
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    max_tokens: 2048
+    thinking: true
+    tool_call_parser: qwen3_xml
+    reasoning_parser: qwen3
+    prefix_cache: true
+
+nfr:
+  cache:
+    enabled: true
+    data_ttl_seconds: 300
+  security:
+    enabled: true
+  audit:
+    enabled: true
+  telemetry:
+    enabled: true
