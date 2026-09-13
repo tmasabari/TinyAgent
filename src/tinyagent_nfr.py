@@ -5,9 +5,6 @@ from time import monotonic
 from typing import Any, Callable
 
 
-_MISS = object()
-
-
 @dataclass
 class _Entry:
     value: Any
@@ -26,7 +23,8 @@ class DataCacheHook:
         key = self.key(context.payload)
         entry = self._items.get(key)
         if entry and entry.expires_at > monotonic():
-            return entry.value
+            context.payload["result"] = entry.value
+            return True
         if entry:
             self._items.pop(key, None)
         return None
@@ -48,9 +46,7 @@ class AllowAllSecurityHook:
     """Default no-op policy for the POC; replace with a host policy in real use."""
 
     def before(self, context: Any) -> Any:
-        if context.kind == "execute":
-            return True
-        return None
+        return True if context.kind == "execute" else None
 
     def after(self, context: Any, result: Any) -> Any:
         return None
