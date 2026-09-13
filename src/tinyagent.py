@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 import re
-from typing import Callable, Any
+from typing import Any, Callable, Protocol
 
 
 class Source(str, Enum):
@@ -37,6 +37,26 @@ class Requirement:
     reason: str
 
 
+@dataclass(frozen=True)
+class HookContext:
+    kind: str
+    payload: dict[str, Any]
+
+
+class Hook(Protocol):
+    def before(self, context: HookContext) -> Any: ...
+    def after(self, context: HookContext, result: Any) -> Any: ...
+
+
+class EventSink(Protocol):
+    def publish(self, name: str, payload: dict[str, Any]) -> None: ...
+
+
+class NullEvents:
+    def publish(self, name: str, payload: dict[str, Any]) -> None:
+        pass
+
+
 CURRENT_WORDS = {
     "latest", "current", "today", "now", "recent", "recently",
     "newest", "updated", "currently", "this week", "this month",
@@ -56,8 +76,7 @@ STATE_WORDS = {
 
 
 def _contains_any(text: str, values: set[str]) -> bool:
-    text = text.lower()
-    return any(v in text for v in values)
+    return any(v in text.lower() for v in values)
 
 
 def _contains_post_cutoff_date(text: str, cutoff: datetime) -> bool:
@@ -102,12 +121,11 @@ def _dedupe(requirements: list[Requirement]) -> list[Requirement]:
 
 
 def runtime_prompt(runtime: Runtime) -> str:
-    modalities = ",".join(runtime.input_modalities)
     return (
         "[RUNTIME]\n"
         f"knowledge_cutoff={runtime.knowledge_cutoff.isoformat()}\n"
         f"current_datetime={runtime.current_datetime.isoformat()}\n"
-        f"input_modalities={modalities}\n"
+        f"input_modalities={','.join(runtime.input_modalities)}\n"
         f"os={runtime.os}\n"
         f"shell={runtime.shell}\n"
         f"working_directory={runtime.working_directory}\n"
@@ -123,7 +141,7 @@ Rules:
 - Treat runtime metadata as authoritative.
 - Never invent knowledge, capabilities, tool results, or execution results.
 - If required information is newer than the knowledge cutoff, retrieve it with get_data(web, ...); never answer from memory first.
-- Retrieve local artifacts with get_data(file, ...) when they are required.
+- Retrieve local artifacts with get_data(file, ...) when required.
 - Retrieve authoritative live/domain state with get_data(domain, ...) when required.
 - Use execute only for necessary permitted actions.
 - Verify important changes/results when practical.
@@ -137,7 +155,21 @@ Tool loop: understand -> retrieve if required -> act if required -> observe -> v
 """
 
 
+def _hook_before(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(h.before(HookContext(kind, payload)) for h in hooks)
+
+
+def _hook_after(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any], result: Any) -> Any:
+    for hook in reversed(hooks):
+        value = hook.after(HookContext(kind, payload), result)
+        if value is not None:
+            result = value
+    return result
+
+
 class TinyAgent:
+    """Functional agent core. Cache, audit and security are optional ports."""
+
     def __init__(
         self,
         model: Callable[[str, str, list[dict[str, Any]]], dict[str, Any]],
@@ -145,14 +177,47 @@ class TinyAgent:
         execute: Callable[[str, str], Any],
         runtime: Runtime,
         max_iterations: int = 8,
+        hooks: tuple[Hook, ...] = (),
+        events: EventSink | None = None,
     ) -> None:
         self.model = model
         self.get_data = get_data
         self.execute = execute
         self.runtime = runtime
         self.max_iterations = max_iterations
+        self.hooks = hooks
+        self.events = events or NullEvents()
+
+    def _event(self, name: str, **payload: Any) -> None:
+        self.events.publish(name, payload)
+
+    def _data(self, source: str, query: str) -> Any:
+        payload = {"source": source, "query": query}
+        self._event("ContextRequested", **payload)
+        decisions = _hook_before(self.hooks, "get_data", payload)
+        for decision in decisions:
+            if decision is not None:
+                self._event("ContextCacheHit", **payload)
+                return decision
+        result = self.get_data(source, query)
+        result = _hook_after(self.hooks, "get_data", payload, result)
+        self._event("ContextRetrieved", **payload)
+        return result
+
+    def _execute(self, operation: str, param: str) -> Any:
+        payload = {"operation": operation, "param": param}
+        self._event("ExecutionRequested", operation=operation)
+        for decision in _hook_before(self.hooks, "execute", payload):
+            if decision is False:
+                self._event("ExecutionDenied", operation=operation)
+                raise PermissionError("execution denied by hook")
+        result = self.execute(operation, param)
+        result = _hook_after(self.hooks, "execute", payload, result)
+        self._event("ExecutionCompleted", operation=operation)
+        return result
 
     def run(self, request: str) -> str:
+        self._event("AgentStarted")
         context: list[dict[str, Any]] = []
 
         for requirement in preflight(request, self.runtime):
@@ -161,30 +226,34 @@ class TinyAgent:
                 "tool": "get_data",
                 "source": requirement.source.value,
                 "query": requirement.query,
-                "result": self.get_data(requirement.source.value, requirement.query),
+                "result": self._data(requirement.source.value, requirement.query),
                 "reason": requirement.reason,
             })
 
         system = SYSTEM_PROMPT + "\n" + runtime_prompt(self.runtime)
-
         for _ in range(self.max_iterations):
+            self._event("ModelRequested")
             response = self.model(system, request, context)
+            self._event("ModelCompleted")
 
             if response.get("answer"):
+                self._event("AgentCompleted")
                 return str(response["answer"])
 
             if call := response.get("get_data"):
-                result = self.get_data(call["source"], call["query"])
-                context.append({"type": "tool_result", "tool": "get_data", "source": call["source"], "query": call["query"], "result": result})
+                result = self._data(call["source"], call["query"])
+                context.append({"type": "tool_result", "tool": "get_data", **call, "result": result})
                 continue
 
             if call := response.get("execute"):
-                result = self.execute(call["operation"], call["param"])
-                context.append({"type": "tool_result", "tool": "execute", "operation": call["operation"], "param": call["param"], "result": result})
+                result = self._execute(call["operation"], call["param"])
+                context.append({"type": "tool_result", "tool": "execute", **call, "result": result})
                 continue
 
+            self._event("AgentFailed")
             return "Unable to complete with the available capabilities."
 
+        self._event("AgentFailed")
         return "Unable to complete within the tool-call limit."
 
 
