@@ -85,22 +85,17 @@ def _contains_post_cutoff_date(text: str, cutoff: datetime) -> bool:
 
 
 def preflight(request: str, runtime: Runtime, controls: PreflightControls) -> list[Requirement]:
-    """Return mandatory context retrievals. All control words come from configuration."""
     requirements: list[Requirement] = []
     lower = request.lower()
-
     if _contains_any(lower, controls.current_words) or _contains_post_cutoff_date(request, runtime.knowledge_cutoff):
         requirements.append(Requirement(Source.WEB, request, "current_or_post_cutoff_information"))
-
     file_match = FILE_RE.search(request)
     if file_match:
         requirements.append(Requirement(Source.FILE, file_match.group(1), "local_artifact_reference"))
     elif _contains_any(lower, controls.file_phrases):
         requirements.append(Requirement(Source.FILE, request, "local_state_required"))
-
     if _contains_any(lower, controls.domain_words) and _contains_any(lower, controls.state_words):
         requirements.append(Requirement(Source.DOMAIN, request, "authoritative_live_or_domain_state"))
-
     return _dedupe(requirements)
 
 
@@ -128,62 +123,43 @@ def runtime_prompt(runtime: Runtime) -> str:
     )
 
 
-SYSTEM_PROMPT = """You are TinyAgent, a small efficient AI agent.
-
-Goal: complete the user's task correctly with minimum reasoning, retrieval, actions, and output.
-
-Rules:
-- Treat runtime metadata as authoritative.
-- Never invent knowledge, capabilities, tool results, or execution results.
-- If required information is newer than the knowledge cutoff, retrieve it with get_data(web, ...); never answer from memory first.
-- Retrieve local artifacts with get_data(file, ...) when required.
-- Retrieve authoritative live/domain state with get_data(domain, ...) when required.
-- Use execute only for necessary permitted actions.
-- Verify important changes/results when practical.
-- Apply KISS, YAGNI, DRY, and POLA.
-- Prefer existing project conventions and standard libraries.
-- Do not introduce unnecessary dependencies, abstractions, files, or features.
-- Plan only enough to choose the next necessary action.
-- Stop as soon as the task is complete.
-
-Tool loop: understand -> retrieve if required -> act if required -> observe -> verify -> stop.
-"""
+def estimate_tokens(text: str) -> int:
+    """Cheap provider-independent estimate; use provider tokenizer for benchmark accuracy."""
+    return max(1, (len(text) + 3) // 4)
 
 
-def _hook_before(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(h.before(HookContext(kind, payload)) for h in hooks)
-
-
-def _hook_after(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any], result: Any) -> Any:
-    for hook in reversed(hooks):
-        value = hook.after(HookContext(kind, payload), result)
-        if value is not None:
-            result = value
-    return result
+def minify_context(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deterministically compact context without an extra model or dependency."""
+    compact: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in context:
+        value = dict(item)
+        value.pop("type", None)
+        key = repr(sorted(value.items(), key=lambda pair: pair[0]))
+        if key in seen:
+            continue
+        seen.add(key)
+        compact.append(value)
+    return compact
 
 
 class TinyAgent:
-    """Functional agent core. Configuration and NFR implementations stay outside."""
-
-    def __init__(
-        self,
-        model: Callable[[str, str, list[dict[str, Any]]], dict[str, Any]],
-        get_data: Callable[[str, str], Any],
-        execute: Callable[[str, str], Any],
-        runtime: Runtime,
-        controls: PreflightControls,
-        max_iterations: int = 8,
-        hooks: tuple[Hook, ...] = (),
-        events: EventSink | None = None,
-    ) -> None:
-        self.model = model
-        self.get_data = get_data
-        self.execute = execute
-        self.runtime = runtime
-        self.controls = controls
-        self.max_iterations = max_iterations
-        self.hooks = hooks
+    def __init__(self, model: Callable[[str, str, list[dict[str, Any]]], dict[str, Any]],
+                 get_data: Callable[[str, str], Any], execute: Callable[[str, str], Any],
+                 runtime: Runtime, controls: PreflightControls, max_iterations: int = 8,
+                 hooks: tuple[Hook, ...] = (), events: EventSink | None = None,
+                 system_prompt: str = "", model_system_prompt: str = "",
+                 strings: dict[str, str] | None = None, minify_enabled: bool = True,
+                 minify_interval_tokens: int = 4096) -> None:
+        self.model, self.get_data, self.execute = model, get_data, execute
+        self.runtime, self.controls = runtime, controls
+        self.max_iterations, self.hooks = max_iterations, hooks
         self.events = events or NullEvents()
+        self.system_prompt = system_prompt
+        self.model_system_prompt = model_system_prompt
+        self.strings = strings or {}
+        self.minify_enabled = minify_enabled
+        self.minify_interval_tokens = max(1, minify_interval_tokens)
 
     def _event(self, name: str, **payload: Any) -> None:
         self.events.publish(name, payload)
@@ -206,51 +182,64 @@ class TinyAgent:
         for decision in _hook_before(self.hooks, "execute", payload):
             if decision is False:
                 self._event("ExecutionDenied", operation=operation)
-                raise PermissionError("execution denied by hook")
+                raise PermissionError(self.strings.get("execution_denied", "execution denied by hook"))
         result = self.execute(operation, param)
         result = _hook_after(self.hooks, "execute", payload, result)
         self._event("ExecutionCompleted", operation=operation)
         return result
 
+    def _minify_if_needed(self, context: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self.minify_enabled:
+            return context
+        tokens = estimate_tokens(repr(context))
+        if tokens >= self.minify_interval_tokens:
+            compact = minify_context(context)
+            if compact != context:
+                self._event("ContextMinified", before_tokens=tokens, after_tokens=estimate_tokens(repr(compact)))
+            return compact
+        return context
+
     def run(self, request: str) -> str:
         self._event("AgentStarted")
         context: list[dict[str, Any]] = []
-
         for requirement in preflight(request, self.runtime, self.controls):
-            context.append({
-                "type": "tool_result",
-                "tool": "get_data",
-                "source": requirement.source.value,
-                "query": requirement.query,
-                "result": self._data(requirement.source.value, requirement.query),
-                "reason": requirement.reason,
-            })
-
-        system = SYSTEM_PROMPT + "\n" + runtime_prompt(self.runtime)
+            context.append({"type": "tool_result", "tool": "get_data", "source": requirement.source.value,
+                            "query": requirement.query, "result": self._data(requirement.source.value, requirement.query),
+                            "reason": requirement.reason})
+        context = minify_context(context) if self.minify_enabled else context
+        system = "\n\n".join(x for x in (self.system_prompt, self.model_system_prompt, runtime_prompt(self.runtime)) if x)
         for _ in range(self.max_iterations):
+            context = self._minify_if_needed(context)
             self._event("ModelRequested")
             response = self.model(system, request, context)
             self._event("ModelCompleted")
-
             if response.get("answer"):
                 self._event("AgentCompleted")
                 return str(response["answer"])
-
             if call := response.get("get_data"):
                 result = self._data(call["source"], call["query"])
                 context.append({"type": "tool_result", "tool": "get_data", **call, "result": result})
                 continue
-
             if call := response.get("execute"):
                 result = self._execute(call["operation"], call["param"])
                 context.append({"type": "tool_result", "tool": "execute", **call, "result": result})
                 continue
-
             self._event("AgentFailed")
-            return "Unable to complete with the available capabilities."
-
+            return self.strings.get("unable_capabilities", "Unable to complete with the available capabilities.")
         self._event("AgentFailed")
-        return "Unable to complete within the tool-call limit."
+        return self.strings.get("unable_limit", "Unable to complete within the tool-call limit.")
+
+
+def _hook_before(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(h.before(HookContext(kind, payload)) for h in hooks)
+
+
+def _hook_after(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any], result: Any) -> Any:
+    for hook in reversed(hooks):
+        value = hook.after(HookContext(kind, payload), result)
+        if value is not None:
+            result = value
+    return result
 
 
 def local_file(path: str, root: str = ".") -> str:
