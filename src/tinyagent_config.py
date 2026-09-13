@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from .tinyagent import PreflightControls
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -24,33 +26,32 @@ class ModelConfig:
 @dataclass(frozen=True)
 class AgentConfig:
     max_iterations: int
-    current_words: frozenset[str]
-    file_phrases: frozenset[str]
-    domain_words: frozenset[str]
-    state_words: frozenset[str]
+    preflight: PreflightControls
     models: dict[str, ModelConfig]
 
 
-def load_config(path: str | Path, model: str) -> AgentConfig:
+def load_config(path: str | Path) -> AgentConfig:
     data: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    preflight = data["preflight"]
+    p = data["preflight"]
     models = {
-        key: ModelConfig(name=value["model"], base_url=value["base_url"],
-                         temperature=float(value["temperature"]), top_p=float(value["top_p"]),
-                         top_k=int(value["top_k"]), max_tokens=int(value["max_tokens"]),
-                         thinking=bool(value["thinking"]),
-                         tool_call_parser=value["tool_call_parser"],
-                         reasoning_parser=value["reasoning_parser"],
-                         prefix_cache=bool(value["prefix_cache"]))
+        key: ModelConfig(
+            name=value["model"], base_url=value["base_url"],
+            temperature=float(value["temperature"]), top_p=float(value["top_p"]),
+            top_k=int(value["top_k"]), max_tokens=int(value["max_tokens"]),
+            thinking=bool(value["thinking"]),
+            tool_call_parser=value["tool_call_parser"],
+            reasoning_parser=value["reasoning_parser"],
+            prefix_cache=bool(value["prefix_cache"]),
+        )
         for key, value in data["models"].items()
     }
-    if model not in models:
-        raise ValueError(f"unknown model profile: {model}")
     return AgentConfig(
         max_iterations=int(data["agent"]["max_iterations"]),
-        current_words=frozenset(preflight["current_words"]),
-        file_phrases=frozenset(preflight["file_phrases"]),
-        domain_words=frozenset(preflight["domain_words"]),
-        state_words=frozenset(preflight["state_words"]),
+        preflight=PreflightControls(
+            current_words=frozenset(p["current_words"]),
+            file_phrases=frozenset(p["file_phrases"]),
+            domain_words=frozenset(p["domain_words"]),
+            state_words=frozenset(p["state_words"]),
+        ),
         models=models,
     )
