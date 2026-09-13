@@ -84,7 +84,8 @@ def _contains_post_cutoff_date(text: str, cutoff: datetime) -> bool:
         year = int(match.group(1))
         month = int(match.group(2) or 1)
         day = int(match.group(3) or 1)
-        if datetime(year, month, day) > cutoff:
+        candidate = datetime(year, month, day, tzinfo=cutoff.tzinfo)
+        if candidate > cutoff:
             return True
     return False
 
