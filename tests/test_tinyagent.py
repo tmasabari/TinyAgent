@@ -1,8 +1,16 @@
 import unittest
 from datetime import datetime, timezone
 
-from src.tinyagent import Runtime, TinyAgent, preflight
+from src.tinyagent import PreflightControls, Runtime, TinyAgent, preflight
 from src.tinyagent_nfr import DataCacheHook, RecordingEvents
+
+
+CONTROLS = PreflightControls(
+    current_words=frozenset({"latest", "current", "today", "now", "recent"}),
+    file_phrases=frozenset({"repository", "repo", "my code"}),
+    domain_words=frozenset({"github", "deployment", "production"}),
+    state_words=frozenset({"my", "status", "running", "failed"}),
+)
 
 
 class Deny:
@@ -21,7 +29,7 @@ class TinyAgentTests(unittest.TestCase):
         )
 
     def test_preflight_requires_web_for_current_request(self):
-        result = preflight("latest Python release", self.runtime())
+        result = preflight("latest Python release", self.runtime(), CONTROLS)
         self.assertEqual(result[0].source.value, "web")
 
     def test_cache_hit_bypasses_data_adapter(self):
@@ -33,6 +41,7 @@ class TinyAgentTests(unittest.TestCase):
             lambda source, query: calls.append(query) or "fresh",
             lambda operation, param: None,
             self.runtime(),
+            controls=CONTROLS,
             hooks=(cache,),
             events=events,
         )
@@ -47,6 +56,7 @@ class TinyAgentTests(unittest.TestCase):
             lambda source, query: None,
             lambda operation, param: self.fail("must not execute"),
             self.runtime(),
+            controls=CONTROLS,
             max_iterations=1,
             hooks=(Deny(),),
         )
