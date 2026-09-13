@@ -1,39 +1,70 @@
 # TinyAgent POC Context
 
-## 1. Problem
+## 1. Objective
 
-Small language models are attractive because of low latency, low infrastructure cost, and local/private deployment. Their usefulness is limited by stale knowledge, missing local/domain state, modality limits and unknown runtime constraints.
+Build a **minimal, high-performance agent runtime for tiny/weak language models**.
 
-TinyAgent tests whether these limitations can be compensated with deterministic JIT retrieval and two tools while keeping the functional runtime extremely small.
+The runtime compensates for model limitations through deterministic just-in-time context acquisition and controlled actions:
 
-## 2. Primary non-functional requirement: performance
+- stale/missing knowledge -> web retrieval;
+- missing local state -> file retrieval;
+- missing live enterprise state -> domain retrieval;
+- missing execution capability -> controlled action;
+- unsupported capability -> explicit limitation/fallback.
 
-**Performance is a first-class design constraint, not an optimization added later.**
+### Primary objective
 
-The agent should avoid recomputing anything that can safely be reused. Application/context caching and inference/KV caching are different layers and must not be conflated.
+> **Maximize task success per unit of latency, tokens and compute while keeping the functional agent extremely small.**
+
+Performance is a first-class constraint. Context reuse, prompt-prefix reuse and inference KV-cache reuse are architectural requirements, not later optimizations.
+
+### Separation objective
+
+The system has four independent concerns:
 
 ```text
-Request
-  |
-  v
-Preflight -> cached context -> stable prompt prefix -> prefix/KV cache -> tiny model
-                  ^                                      |
-                  |                                      v
-             data cache <--------- tools <--------- observations
+                 +---------------------------+
+                 | CONFIGURATION             |
+                 | selects/composes behavior |
+                 +-------------+-------------+
+                               |
+       +-----------------------+-----------------------+
+       |                       |                       |
+       v                       v                       v
++-------------+         +-------------+         +-------------+
+| FUNCTIONAL  |         | NFR         |         | PROVIDER    |
+| CORE        | hooks/  | cache       |         | inference   |
+| preflight   | events  | security    |         | prompt/KV   |
+| context     | <------ | audit       |         | caching     |
+| model/tools |         | telemetry   |         |             |
++-------------+         +-------------+         +-------------+
 ```
 
-Targets:
+**Configuration composes these parts; it does not become part of the agent algorithm.**
 
-- minimize time-to-first-token (TTFT);
-- minimize prefill work and repeated input tokens;
-- minimize retrieval latency and duplicate retrievals;
-- minimize tool calls and output tokens;
-- maximize context reuse and provider KV/prefix-cache hits;
-- preserve task success while doing so.
+---
 
-## 3. Functional architecture
+## 2. Architectural Rules
 
-The core remains deliberately small:
+1. Functional core remains small and deterministic where possible.
+2. NFRs are cross-cutting infrastructure and are isolated behind hooks/events/adapters.
+3. Configuration is loaded and validated outside the functional core.
+4. Provider-specific inference/cache behavior stays in model adapters.
+5. Runtime state is supplied by the host and is distinct from configuration.
+6. Disabling an NFR must not require changing the functional algorithm.
+7. Prefer standard library and in-process mechanisms for the POC.
+8. Do not add abstractions until measurement proves the need.
+
+```text
+KISS + YAGNI + DRY + POLA
+          |
+          v
+small ports, small config, small core
+```
+
+---
+
+## 3. Functional Architecture
 
 ```text
 request
@@ -46,49 +77,163 @@ request
   -> done
 ```
 
-Core responsibilities are only interpretation, retrieval/action selection, observation and completion.
+The functional core owns only:
 
-## 4. Cross-cutting NFR architecture
+- request interpretation;
+- deterministic preflight;
+- context assembly;
+- model invocation;
+- tool selection;
+- observation;
+- completion/verification flow.
 
-Cache, security, audit, telemetry, tracing, rate limits and cost controls must be completely separated from the functional architecture.
+The core does **not** own:
 
-### Rule
+- cache implementation;
+- security policy implementation;
+- audit persistence;
+- telemetry/tracing backend;
+- YAML/environment parsing;
+- provider SDKs;
+- provider-specific KV-cache logic.
 
-> NFRs may observe, accelerate, decorate or constrain the functional pipeline, but the core must not depend on their implementations.
+---
 
-Use two small extension mechanisms:
+## 4. Configuration Architecture
 
-```text
-HOOK  = intercept / allow / deny / replace
-EVENT = observe / record
-```
-
-Examples:
-
-| NFR | Mechanism | Why |
-|---|---|---|
-| Data cache | `before/after` hook | hit can bypass the data adapter |
-| Security | `before` hook | can deny execution |
-| Audit | event sink | observes without changing behavior |
-| Metrics | event sink | measures without core logic |
-| Tracing | event sink | correlation without core dependency |
-| Provider KV cache | model adapter | provider/inference-engine concern |
-| Rate limit | host hook | policy before expensive work |
-
-The core should know only tiny ports/interfaces, never Redis, OpenTelemetry, provider SDKs, databases or security products.
-
-### Desired property
+Configuration is its own layer.
 
 ```text
-NFR OFF  -> same functional behavior
-NFR ON   -> same functional behavior + acceleration/controls/observability
+YAML / environment / host settings
+                |
+                v
+        Config Loader/Validator
+                |
+       +--------+--------+
+       |        |        |
+       v        v        v
+   Functional  NFR   Inference
+      config  config   config
+       |        |        |
+       v        v        v
+     Core    hooks/    model adapter
+             events
 ```
 
-If disabling an NFR requires changing the agent algorithm, the separation is wrong.
+### 4.1 Configuration responsibilities
 
-## 5. Tiny ports
+The configuration layer should:
 
-Keep interfaces intentionally small:
+- load configuration;
+- apply environment overrides where needed;
+- validate values;
+- separate functional, NFR and inference settings;
+- construct/compose adapters and hooks.
+
+It should **not** execute agent logic.
+
+### 4.2 Functional configuration
+
+Only settings required by the functional core belong here:
+
+```yaml
+agent:
+  max_iterations: 8
+
+model:
+  name: tiny-model
+```
+
+The core receives typed/validated values. It should not know whether they came from YAML, environment variables or code.
+
+### 4.3 Runtime configuration/state
+
+Runtime facts are supplied by the host:
+
+```yaml
+runtime:
+  knowledge_cutoff: 2025-06-01
+  current_datetime: 2026-09-13T17:00:00+05:30
+  input_modalities: [text]
+  os: windows
+  shell: powershell
+  working_directory: C:\repo
+```
+
+Strictly speaking, this is **runtime state/capability context**, not application configuration. Keep the distinction because the model needs authoritative observed capabilities.
+
+Current time should not unnecessarily precede stable prompt material because it reduces prefix-cache reuse.
+
+### 4.4 NFR configuration
+
+NFR settings are completely isolated:
+
+```yaml
+nfr:
+  cache:
+    enabled: true
+    data_ttl_seconds: 300
+  security:
+    enabled: true
+  audit:
+    enabled: true
+  telemetry:
+    enabled: true
+```
+
+The functional core never reads `nfr.*`.
+
+### 4.5 Inference configuration
+
+Provider-specific settings belong to the inference adapter:
+
+```yaml
+inference:
+  provider: vllm
+  model: tiny-model
+  prefix_cache: true
+```
+
+The core only sees the `Model` port. It must not contain `if provider == ...` logic.
+
+### 4.6 Example complete POC configuration
+
+```yaml
+agent:
+  max_iterations: 8
+
+model:
+  name: tiny-model
+
+nfr:
+  cache:
+    enabled: true
+    data_ttl_seconds: 300
+  security:
+    enabled: true
+  audit:
+    enabled: true
+  telemetry:
+    enabled: true
+
+inference:
+  provider: local
+  prefix_cache: true
+```
+
+Runtime facts remain host-supplied rather than being copied into this static configuration.
+
+### Configuration invariant
+
+> **Configuration selects components and values; it never decides task-specific behavior.**
+
+Do not build a configuration DSL. YAML plus a small loader/validator is enough for the POC.
+
+---
+
+## 5. Ports and Composition
+
+Keep ports tiny:
 
 ```python
 class Model:
@@ -108,19 +253,90 @@ class EventSink:
     def publish(self, name, payload): ...
 ```
 
-The POC uses callable adapters for model/data/execution and exposes equivalent hook/event contracts in `src/tinyagent.py`.
+Composition happens outside the core:
 
-## 6. Cache architecture
+```text
+config
+  |
+  +--> functional adapters
+  +--> cache hooks
+  +--> security hooks
+  +--> audit/telemetry event sinks
+  `--> model/provider adapter
+                |
+                `--> native prompt/KV cache
+```
 
-### L1: stable prompt cache
+The current POC uses Python callables for the functional adapters and lightweight Protocol-compatible hook/event contracts.
 
-Keep stable system instructions and tool definitions deterministic and before volatile data. Do not place timestamps, request IDs or changing state before the cache boundary.
+---
 
-### L2: reusable context cache
+## 6. Cross-Cutting NFR Architecture
 
-Reuse stable project/session context where safe. Treat context as reusable objects rather than blindly replaying a growing transcript.
+NFRs may observe, accelerate, decorate or constrain the functional pipeline, but their implementations must remain outside the core.
 
-Conceptually:
+```text
+HOOK  = intercept / allow / deny / accelerate
+EVENT = observe / record
+```
+
+| Concern | Mechanism | Responsibility |
+|---|---|---|
+| Data cache | hook | return reusable data before adapter call |
+| Security | hook | deny unauthorized action |
+| Rate limit | hook | reject expensive/forbidden work |
+| Audit | event sink | record what happened |
+| Metrics | event sink | measure latency/tokens/cache |
+| Tracing | event sink | correlate operations |
+| Provider KV cache | model adapter | reuse inference computation |
+
+Desired behavior:
+
+```text
+NFR OFF -> functional path still works
+NFR ON  -> same functional path + controls/acceleration/observation
+```
+
+---
+
+## 7. Performance Architecture
+
+Performance is optimized through multiple independent cache boundaries.
+
+```text
+L1  stable prompt/config prefix
+L2  reusable session/context
+L3  retrieved data
+L4  provider prefix/KV
+L5  safe deterministic results (later)
+```
+
+### L1 — prompt prefix reuse
+
+Stable content must precede changing content:
+
+```text
+STATIC
+  system prompt
+  tool definitions
+  fixed policies/capabilities
+
+SESSION-STABLE
+  project context
+  stable instructions
+  reusable retrieved context
+
+DYNAMIC
+  current task
+  current time when needed
+  latest observation
+```
+
+Do not place request IDs, timestamps or volatile state before stable content.
+
+### L2 — context reuse
+
+Represent reusable context as small identifiable items rather than blindly replaying a growing transcript.
 
 ```text
 TASK
@@ -133,25 +349,34 @@ TASK
     analysis
 ```
 
-Each reusable item should have enough identity to detect changes: source, key/path, content/version hash and relevant generation.
+Identity should include source/key and version/content hash where appropriate.
 
-### L3: retrieved data cache
+### L3 — data cache
 
-`DataCacheHook` provides a small in-process TTL cache around `get_data`.
+The optional data-cache hook can cache `get_data` results.
 
-- file data: invalidate when content/mtime changes;
-- web data: use short TTL according to freshness requirements;
-- domain data: use TTL appropriate to the state being observed.
+Suggested identity/TTL:
 
-A cache hit must bypass the underlying data adapter. Cache miss calls the adapter and stores the result.
+```text
+file   -> path + version/mtime/hash
+web    -> normalized query + freshness policy + TTL
+domain -> normalized query + security context + short TTL
+```
 
-For multi-tenant use, the cache key must include all relevant security boundaries (tenant/user/project/model/policy context). The cache implementation owns key construction so the functional core remains unaware of identity infrastructure.
+Cache hits bypass the underlying adapter.
 
-### L4: inference prefix/KV cache
+### L4 — provider prefix/KV cache
 
-The core does not implement provider KV caching. The model adapter should map the stable prefix to the capabilities of the selected inference engine/provider, such as provider prompt caching, vLLM automatic prefix caching or local runtime state.
+The functional core does not implement KV caching.
 
-Expose metrics where available:
+```text
+TinyAgent -> Model port -> provider adapter
+                         +--> prompt cache
+                         +--> vLLM prefix/KV
+                         +--> local inference cache
+```
+
+The adapter exposes cache metrics when supported:
 
 ```text
 input_tokens
@@ -164,59 +389,38 @@ decode_ms
 latency_ms
 ```
 
-Do not fake a KV-cache abstraction inside TinyAgent. The adapter is the correct boundary.
+### L5 — action/result cache
 
-### L5: safe action/result cache
+Later only. Cache safe, deterministic, read-only operations. Never blindly replay side effects.
 
-Optional and later. Read-only deterministic operations may be cached. Mutations must invalidate affected context. Do not cache arbitrary side effects.
+---
 
-## 7. Cache invalidation
+## 8. Cache Invalidation
 
-The safest POC rule is narrow invalidation:
+Prefer narrow invalidation:
 
 ```text
 edit FILE A
-   -> invalidate FILE A and dependent context
-   -> retain unrelated FILE B / WEB A
+   -> invalidate FILE A + dependent derived context
+   -> retain unrelated cached context
 ```
 
-A workspace generation/version can cheaply invalidate derived context after mutations without flushing everything. Add it only when evaluation demonstrates mutation-heavy workloads.
+A generation/version number may later simplify mutation-heavy invalidation. Do not add it until measurements justify it.
 
-## 8. Context ordering for prefix/KV reuse
+Cache isolation is also a security requirement. Sensitive keys must include the relevant tenant/user/project/security context.
 
-Use this conceptual order:
+---
 
-```text
-STATIC
-  system prompt
-  tool definitions
-  policies
-  fixed capabilities
+## 9. Deterministic Preflight
 
-SESSION-STABLE
-  project identity
-  stable instructions
-  reusable retrieved context
-
-DYNAMIC
-  current task
-  current time
-  latest observation
-  current tool result
-```
-
-The exact provider API belongs to the model adapter. The important invariant is stable-before-changing.
-
-## 9. Deterministic preflight
-
-Preflight handles decisions that runtime information can establish reliably.
+Preflight makes decisions the runtime can establish reliably.
 
 ### MUST retrieve web
 
 - latest/current/today/recent/updated requests;
 - post-cutoff dates;
 - current documentation/pricing/releases/vulnerabilities/availability;
-- explicit source requests.
+- explicitly requested external sources.
 
 ### MUST retrieve file
 
@@ -226,7 +430,7 @@ Preflight handles decisions that runtime information can establish reliably.
 
 ### MUST retrieve domain
 
-- deployment status;
+- deployment state;
 - tickets/issues;
 - cloud resources;
 - production metrics/logs/monitoring;
@@ -235,68 +439,74 @@ Preflight handles decisions that runtime information can establish reliably.
 
 ### MAY retrieve
 
-Uncertain facts or supporting context when it materially improves correctness.
+Uncertain facts or supporting context when materially useful.
 
 ### DO NOT retrieve
 
 Information already in context, stable knowledge the model can reliably provide, or unnecessary background.
 
-The model must not answer from stale memory before mandatory web retrieval.
+The model must never answer from stale memory before a mandatory retrieval.
 
-## 10. Runtime contract
+---
 
-The host supplies authoritative values:
-
-```yaml
-runtime:
-  knowledge_cutoff: 2025-06-01
-  current_datetime: 2026-09-13T14:30:00+05:30
-  input_modalities: [text]
-  os: windows
-  shell: powershell
-  working_directory: C:\repo
-```
-
-The model must never claim unsupported capabilities.
-
-## 11. Tool contract
-
-```yaml
-get_data:
-  source: file | web | domain
-  query: string
-
-execute:
-  operation: edit | os | web
-  param: string
-```
-
-The host owns authorization, sandboxing and resource limits.
-
-## 12. Agent loop
+## 10. Agent Loop
 
 ```text
+request
+  |
 preflight
-   |
+  |
 mandatory retrieval
-   |
+  |
 context assembly
-   |
+  |
 model decision
-   +---- get_data ----> observation --+
-   |                                  |
-   +---- execute -----> observation --+
-                                      |
-                                  next decision
+  +---- get_data ----> observation --+
+  |                                  |
+  +---- execute -----> observation -+
                                       |
                                 verify / done
 ```
 
-The model plans only enough to choose the next useful action.
+The model plans only enough to select the next necessary action.
 
-## 13. Events
+No cache lookup, security implementation, audit persistence, telemetry provider or configuration parsing is embedded in this loop.
 
-Keep the event vocabulary small. Suggested events:
+---
+
+## 11. Security Boundary
+
+Security is a host-controlled pre-action hook.
+
+```text
+model proposal
+      |
+      v
+security/policy hook
+    /       \
+  deny      allow
+              |
+         sandboxed host
+```
+
+Enforce:
+
+- path/command allowlists;
+- network policy;
+- OS/shell compatibility;
+- destructive-action restrictions;
+- timeouts/resource limits;
+- tenant/user/project isolation.
+
+The model never receives unrestricted host authority.
+
+---
+
+## 12. Audit, Metrics and Telemetry
+
+These consume events and must not become core dependencies.
+
+Small event vocabulary:
 
 ```text
 AgentStarted
@@ -312,47 +522,43 @@ ExecutionDenied
 ExecutionCompleted
 ```
 
-Events should carry metadata, not duplicate large file/web/tool payloads. Store large artifacts separately if needed.
+Events should contain metadata, not duplicate large model/tool payloads.
 
-## 14. Security
+---
 
-Security is a pre-action hook, not a model instruction alone:
+## 13. System Prompt Requirements
+
+The prompt should instruct the tiny model to:
+
+1. treat runtime metadata as authoritative;
+2. never invent capabilities/results;
+3. retrieve mandatory current/post-cutoff information before answering;
+4. retrieve local/domain state when required;
+5. use only the two tools;
+6. execute only necessary permitted actions;
+7. verify important changes;
+8. apply KISS/YAGNI/DRY/POLA;
+9. prefer existing conventions and standard libraries;
+10. plan minimally and stop when complete.
+
+Deterministic runtime policy should enforce what the runtime already knows rather than spending model tokens rediscovering it.
+
+---
+
+## 14. Evaluation and Performance Gates
+
+Compare:
 
 ```text
-model proposal
-     |
-     v
-security/policy hook
-   /       \
- deny     allow
-            |
-        sandboxed execute
+A Tiny/no tools
+B Tiny + get_data
+C Tiny + both tools
+D Strong/no tools
+E TinyAgent + preflight
+F + data/context cache
+G + provider KV/prefix cache
+H + all NFRs
 ```
-
-Enforce path and command allowlists, network policy, OS compatibility, destructive-action restrictions, timeouts and resource limits in the host.
-
-Cache isolation is also a security responsibility: never share sensitive cached data across incompatible security contexts.
-
-## 15. Audit and telemetry
-
-Audit and telemetry consume events. The core must not know where events are stored.
-
-A local POC can use an in-memory recorder. Production can connect the same event port to a logging/tracing/metrics backend without modifying TinyAgent.
-
-## 16. Evaluation
-
-Benchmark at least:
-
-- static knowledge;
-- post-cutoff knowledge;
-- local file tasks;
-- multi-file tasks;
-- live domain state;
-- edit-and-test;
-- unsupported modalities;
-- denied/unsafe actions;
-- repeated equivalent queries to measure cache reuse;
-- repeated turns with a stable prompt prefix to measure provider KV/prefix reuse.
 
 Measure:
 
@@ -360,8 +566,8 @@ Measure:
 Task success
 Accuracy / hallucination
 Tool calls
-Input / output tokens
-Cache-read / cache-write tokens
+Input/output tokens
+Cache-read/write tokens
 Context reuse ratio
 KV cache hit ratio
 Fresh context ratio
@@ -382,39 +588,31 @@ KV Cache Hit Ratio  = cache-read tokens / total input tokens
 Fresh Context Ratio = new context tokens / total context tokens
 ```
 
-The performance goal is not "highest cache hit rate" in isolation. It is lower latency/token cost with unchanged or improved task success and freshness.
+A cache optimization fails if it improves hit rate but harms freshness, correctness, security or overall latency.
 
-## 17. System prompt requirements
+---
 
-The system prompt should say:
-
-1. you are a tiny efficient agent;
-2. runtime metadata is authoritative;
-3. never invent capabilities/results;
-4. mandatory current/post-cutoff information must be retrieved before answering;
-5. local/domain state must be retrieved when required;
-6. use only the two tools;
-7. execute only permitted necessary actions;
-8. verify important changes;
-9. use KISS/YAGNI/DRY/POLA;
-10. prefer standard libraries and existing conventions;
-11. plan minimally and stop when complete.
-
-## 18. Explicit non-goals for v0
+## 15. Explicit Non-Goals for v0
 
 Do not add without measurements:
 
 - Redis/distributed cache;
-- vector DB;
+- vector database;
 - long-term memory;
 - planner/critic agents;
 - multi-agent orchestration;
 - large tool catalog;
 - workflow DSL;
 - generic agent framework;
-- provider-specific KV code in the core.
+- provider-specific KV implementation in the functional core;
+- configuration DSL;
+- NFR logic embedded in the core.
 
-## 19. Relationship to TinyRouter
+YAML + a small configuration composition layer is sufficient.
+
+---
+
+## 16. Relationship to TinyRouter
 
 TinyRouter asks:
 
@@ -428,4 +626,21 @@ TinyAgent asks:
 What does the tiny model need to acquire or do to solve it?
 ```
 
-They can later compose so TinyAgent attempts the cheap path first and TinyRouter escalates only when required.
+Future composition:
+
+```text
+request
+   |
+TinyAgent
+   |
+   +--> solve cheaply with tiny model/tools
+   |
+   +--> cannot solve
+            |
+            v
+       TinyRouter
+            |
+       stronger model
+```
+
+Escalation remains a fallback rather than the default solution to capability gaps.
