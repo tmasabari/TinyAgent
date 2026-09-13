@@ -1,67 +1,40 @@
-# Functional controls, model profiles and NFR defaults.
-# Runtime facts (time, OS, cwd, knowledge cutoff) are supplied by the host.
+# All tunable prompts, control words and model settings live here.
 
 agent:
   max_iterations: 8
+  context_minify:
+    enabled: true
+    interval_tokens: 4096
+
+prompts:
+  system: |
+    You are TinyAgent, a small efficient AI agent.
+    Goal: complete the user's task correctly with minimum reasoning, retrieval, actions, and output.
+    Treat runtime metadata as authoritative.
+    Never invent knowledge, capabilities, tool results, or execution results.
+    If required information is newer than the knowledge cutoff, retrieve it with get_data(web, ...); never answer from memory first.
+    Retrieve local artifacts with get_data(file, ...) when required.
+    Retrieve authoritative live/domain state with get_data(domain, ...) when required.
+    Use execute only for necessary permitted actions.
+    Verify important changes/results when practical.
+    Apply KISS, YAGNI, DRY, and POLA.
+    Prefer existing project conventions and standard libraries.
+    Do not introduce unnecessary dependencies, abstractions, files, or features.
+    Plan only enough to choose the next necessary action.
+    Stop as soon as the task is complete.
+    Tool loop: understand -> retrieve if required -> act if required -> observe -> verify -> stop.
+
+  strings:
+    unable_capabilities: Unable to complete with the available capabilities.
+    unable_limit: Unable to complete within the tool-call limit.
+    execution_denied: execution denied by hook
+    path_outside_root: path outside working directory
 
 preflight:
-  current_words:
-    - latest
-    - current
-    - today
-    - now
-    - recent
-    - recently
-    - newest
-    - updated
-    - currently
-    - this week
-    - this month
-  file_phrases:
-    - my code
-    - my project
-    - this file
-    - repository
-    - repo
-    - codebase
-    - local config
-    - local logs
-  domain_words:
-    - github
-    - jira
-    - azure
-    - aws
-    - deployment
-    - production
-    - logs
-    - metrics
-    - monitoring
-    - ticket
-    - issue
-    - pull request
-    - branch
-    - commit
-    - resource group
-    - lambda
-    - ec2
-    - cloudwatch
-    - database
-    - database state
-    - environment
-  state_words:
-    - my
-    - our
-    - this
-    - status
-    - running
-    - deployed
-    - configured
-    - failed
-    - failure
-    - logs
-    - metrics
-    - production
-    - environment
+  current_words: [latest, current, today, now, recent, recently, newest, updated, currently, this week, this month]
+  file_phrases: [my code, my project, this file, repository, repo, codebase, local config, local logs]
+  domain_words: [github, jira, azure, aws, deployment, production, logs, metrics, monitoring, ticket, issue, pull request, branch, commit, resource group, lambda, ec2, cloudwatch, database, database state, environment]
+  state_words: [my, our, this, status, running, deployed, configured, failed, failure, logs, metrics, production, environment]
 
 models:
   ling-3.0-tiny:
@@ -75,6 +48,8 @@ models:
     tool_call_parser: ling3
     reasoning_parser: ling3
     prefix_cache: true
+    system_prompt: |
+      Optimize for concise, reliable tool selection and minimal unnecessary reasoning.
 
   ornith-1.5-9b:
     model: ornith-ai/Ornith-1.5-9B
@@ -87,6 +62,8 @@ models:
     tool_call_parser: qwen3_xml
     reasoning_parser: qwen3
     prefix_cache: true
+    system_prompt: |
+      Optimize for precise coding and reliable tool selection. Keep reasoning and final output concise.
 
 nfr:
   cache:
