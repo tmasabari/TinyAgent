@@ -124,23 +124,38 @@ def runtime_prompt(runtime: Runtime) -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """Cheap provider-independent estimate; use provider tokenizer for benchmark accuracy."""
     return max(1, (len(text) + 3) // 4)
 
 
 def minify_context(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deterministically compact context without an extra model or dependency."""
+    """Lossless structural compaction; never ask another model to summarize context."""
     compact: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in context:
         value = dict(item)
         value.pop("type", None)
+        value.pop("reason", None)
+        if value.get("tool") == "get_data":
+            value = {"d": value.get("source"), "q": value.get("query"), "r": value.get("result")}
+        elif value.get("tool") == "execute":
+            value = {"x": value.get("operation"), "p": value.get("param"), "r": value.get("result")}
         key = repr(sorted(value.items(), key=lambda pair: pair[0]))
-        if key in seen:
-            continue
-        seen.add(key)
-        compact.append(value)
+        if key not in seen:
+            seen.add(key)
+            compact.append(value)
     return compact
+
+
+def _hook_before(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(h.before(HookContext(kind, payload)) for h in hooks)
+
+
+def _hook_after(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any], result: Any) -> Any:
+    for hook in reversed(hooks):
+        value = hook.after(HookContext(kind, payload), result)
+        if value is not None:
+            result = value
+    return result
 
 
 class TinyAgent:
@@ -160,6 +175,7 @@ class TinyAgent:
         self.strings = strings or {}
         self.minify_enabled = minify_enabled
         self.minify_interval_tokens = max(1, minify_interval_tokens)
+        self._last_minify_tokens = 0
 
     def _event(self, name: str, **payload: Any) -> None:
         self.events.publish(name, payload)
@@ -192,12 +208,14 @@ class TinyAgent:
         if not self.minify_enabled:
             return context
         tokens = estimate_tokens(repr(context))
-        if tokens >= self.minify_interval_tokens:
-            compact = minify_context(context)
-            if compact != context:
-                self._event("ContextMinified", before_tokens=tokens, after_tokens=estimate_tokens(repr(compact)))
-            return compact
-        return context
+        if tokens < self._last_minify_tokens + self.minify_interval_tokens:
+            return context
+        compact = minify_context(context)
+        after = estimate_tokens(repr(compact))
+        self._last_minify_tokens = after
+        if compact != context:
+            self._event("ContextMinified", before_tokens=tokens, after_tokens=after)
+        return compact
 
     def run(self, request: str) -> str:
         self._event("AgentStarted")
@@ -206,7 +224,11 @@ class TinyAgent:
             context.append({"type": "tool_result", "tool": "get_data", "source": requirement.source.value,
                             "query": requirement.query, "result": self._data(requirement.source.value, requirement.query),
                             "reason": requirement.reason})
-        context = minify_context(context) if self.minify_enabled else context
+        if self.minify_enabled:
+            before = estimate_tokens(repr(context))
+            context = minify_context(context)
+            self._last_minify_tokens = estimate_tokens(repr(context))
+            self._event("ContextMinified", before_tokens=before, after_tokens=self._last_minify_tokens)
         system = "\n\n".join(x for x in (self.system_prompt, self.model_system_prompt, runtime_prompt(self.runtime)) if x)
         for _ in range(self.max_iterations):
             context = self._minify_if_needed(context)
@@ -218,28 +240,16 @@ class TinyAgent:
                 return str(response["answer"])
             if call := response.get("get_data"):
                 result = self._data(call["source"], call["query"])
-                context.append({"type": "tool_result", "tool": "get_data", **call, "result": result})
+                context.append({"tool": "get_data", **call, "result": result})
                 continue
             if call := response.get("execute"):
                 result = self._execute(call["operation"], call["param"])
-                context.append({"type": "tool_result", "tool": "execute", **call, "result": result})
+                context.append({"tool": "execute", **call, "result": result})
                 continue
             self._event("AgentFailed")
             return self.strings.get("unable_capabilities", "Unable to complete with the available capabilities.")
         self._event("AgentFailed")
         return self.strings.get("unable_limit", "Unable to complete within the tool-call limit.")
-
-
-def _hook_before(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(h.before(HookContext(kind, payload)) for h in hooks)
-
-
-def _hook_after(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any], result: Any) -> Any:
-    for hook in reversed(hooks):
-        value = hook.after(HookContext(kind, payload), result)
-        if value is not None:
-            result = value
-    return result
 
 
 def local_file(path: str, root: str = ".") -> str:
