@@ -31,6 +31,14 @@ class Runtime:
 
 
 @dataclass(frozen=True)
+class PreflightControls:
+    current_words: frozenset[str]
+    file_phrases: frozenset[str]
+    domain_words: frozenset[str]
+    state_words: frozenset[str]
+
+
+@dataclass(frozen=True)
 class Requirement:
     source: Source
     query: str
@@ -57,25 +65,11 @@ class NullEvents:
         pass
 
 
-CURRENT_WORDS = {
-    "latest", "current", "today", "now", "recent", "recently",
-    "newest", "updated", "currently", "this week", "this month",
-}
 FILE_RE = re.compile(r"(?:^|[\s\"'`(])((?:[\w.-]+/)*[\w.-]+\.(?:cs|fs|vb|js|ts|tsx|jsx|py|java|go|rs|cpp|c|h|json|yaml|yml|xml|sql|md|txt|csproj|sln|log))(?:$|[\s\"'`),])", re.I)
 DATE_RE = re.compile(r"\b(20\d{2})(?:-(\d{1,2})(?:-(\d{1,2}))?)?\b")
-DOMAIN_WORDS = {
-    "github", "jira", "azure", "aws", "deployment", "production",
-    "logs", "metrics", "monitoring", "ticket", "issue", "pull request",
-    "branch", "commit", "resource group", "lambda", "ec2", "cloudwatch",
-    "database", "database state", "environment",
-}
-STATE_WORDS = {
-    "my", "our", "this", "status", "running", "deployed", "configured",
-    "failed", "failure", "logs", "metrics", "production", "environment",
-}
 
 
-def _contains_any(text: str, values: set[str]) -> bool:
+def _contains_any(text: str, values: frozenset[str]) -> bool:
     return any(v in text.lower() for v in values)
 
 
@@ -90,21 +84,21 @@ def _contains_post_cutoff_date(text: str, cutoff: datetime) -> bool:
     return False
 
 
-def preflight(request: str, runtime: Runtime) -> list[Requirement]:
-    """Return mandatory context retrievals. Conservative by design."""
+def preflight(request: str, runtime: Runtime, controls: PreflightControls) -> list[Requirement]:
+    """Return mandatory context retrievals. All control words come from configuration."""
     requirements: list[Requirement] = []
     lower = request.lower()
 
-    if _contains_any(lower, CURRENT_WORDS) or _contains_post_cutoff_date(request, runtime.knowledge_cutoff):
+    if _contains_any(lower, controls.current_words) or _contains_post_cutoff_date(request, runtime.knowledge_cutoff):
         requirements.append(Requirement(Source.WEB, request, "current_or_post_cutoff_information"))
 
     file_match = FILE_RE.search(request)
     if file_match:
         requirements.append(Requirement(Source.FILE, file_match.group(1), "local_artifact_reference"))
-    elif _contains_any(lower, {"my code", "my project", "this file", "repository", "repo", "codebase", "local config", "local logs"}):
+    elif _contains_any(lower, controls.file_phrases):
         requirements.append(Requirement(Source.FILE, request, "local_state_required"))
 
-    if _contains_any(lower, DOMAIN_WORDS) and _contains_any(lower, STATE_WORDS):
+    if _contains_any(lower, controls.domain_words) and _contains_any(lower, controls.state_words):
         requirements.append(Requirement(Source.DOMAIN, request, "authoritative_live_or_domain_state"))
 
     return _dedupe(requirements)
@@ -169,7 +163,7 @@ def _hook_after(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any], res
 
 
 class TinyAgent:
-    """Functional agent core. Cache, audit and security are optional ports."""
+    """Functional agent core. Configuration and NFR implementations stay outside."""
 
     def __init__(
         self,
@@ -177,6 +171,7 @@ class TinyAgent:
         get_data: Callable[[str, str], Any],
         execute: Callable[[str, str], Any],
         runtime: Runtime,
+        controls: PreflightControls,
         max_iterations: int = 8,
         hooks: tuple[Hook, ...] = (),
         events: EventSink | None = None,
@@ -185,6 +180,7 @@ class TinyAgent:
         self.get_data = get_data
         self.execute = execute
         self.runtime = runtime
+        self.controls = controls
         self.max_iterations = max_iterations
         self.hooks = hooks
         self.events = events or NullEvents()
@@ -220,7 +216,7 @@ class TinyAgent:
         self._event("AgentStarted")
         context: list[dict[str, Any]] = []
 
-        for requirement in preflight(request, self.runtime):
+        for requirement in preflight(request, self.runtime, self.controls):
             context.append({
                 "type": "tool_result",
                 "tool": "get_data",
@@ -230,8 +226,6 @@ class TinyAgent:
                 "reason": requirement.reason,
             })
 
-        # Keep stable prompt material before the changing runtime block so provider
-        # prefix/KV caches can reuse the longest possible prefix.
         system = SYSTEM_PROMPT + "\n" + runtime_prompt(self.runtime)
         for _ in range(self.max_iterations):
             self._event("ModelRequested")
@@ -259,7 +253,6 @@ class TinyAgent:
         return "Unable to complete within the tool-call limit."
 
 
-# Host adapters deliberately stay outside this module.
 def local_file(path: str, root: str = ".") -> str:
     target = (Path(root) / path).resolve()
     root_path = Path(root).resolve()
