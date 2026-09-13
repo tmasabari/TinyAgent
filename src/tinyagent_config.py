@@ -21,18 +21,24 @@ class ModelConfig:
     tool_call_parser: str
     reasoning_parser: str
     prefix_cache: bool
+    system_prompt: str
 
 
 @dataclass(frozen=True)
 class AgentConfig:
     max_iterations: int
+    minify_enabled: bool
+    minify_interval_tokens: int
     preflight: PreflightControls
+    system_prompt: str
+    strings: dict[str, str]
     models: dict[str, ModelConfig]
 
 
 def load_config(path: str | Path) -> AgentConfig:
     data: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     p = data["preflight"]
+    prompts = data["prompts"]
     models = {
         key: ModelConfig(
             name=value["model"], base_url=value["base_url"],
@@ -42,11 +48,16 @@ def load_config(path: str | Path) -> AgentConfig:
             tool_call_parser=value["tool_call_parser"],
             reasoning_parser=value["reasoning_parser"],
             prefix_cache=bool(value["prefix_cache"]),
+            system_prompt=value.get("system_prompt", "").strip(),
         )
         for key, value in data["models"].items()
     }
     return AgentConfig(
         max_iterations=int(data["agent"]["max_iterations"]),
+        minify_enabled=bool(data["agent"]["context_minify"]["enabled"]),
+        minify_interval_tokens=int(data["agent"]["context_minify"]["interval_tokens"]),
+        system_prompt=prompts["system"].strip(),
+        strings={k: str(v) for k, v in prompts.get("strings", {}).items()},
         preflight=PreflightControls(
             current_words=frozenset(p["current_words"]),
             file_phrases=frozenset(p["file_phrases"]),
