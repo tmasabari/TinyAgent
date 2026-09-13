@@ -2,366 +2,430 @@
 
 ## 1. Problem
 
-Small language models are attractive because of low latency, low infrastructure cost, and local/private deployment. Their usefulness is limited by:
+Small language models are attractive because of low latency, low infrastructure cost, and local/private deployment. Their usefulness is limited by stale knowledge, missing local/domain state, modality limits and unknown runtime constraints.
 
-1. stale knowledge caused by the model knowledge cutoff;
-2. lack of access to local files and repository state;
-3. lack of live enterprise/domain state;
-4. declared modality limitations such as text-only input;
-5. lack of awareness of runtime constraints such as OS, shell, working directory, and allowed execution capabilities.
+TinyAgent tests whether these limitations can be compensated with deterministic JIT retrieval and two tools while keeping the functional runtime extremely small.
 
-TinyAgent tests whether these limitations can be compensated with a very small tool surface and deterministic runtime policies.
+## 2. Primary non-functional requirement: performance
 
-## 2. Hypothesis
+**Performance is a first-class design constraint, not an optimization added later.**
 
-A small model can complete materially more useful tasks when the runtime:
+The agent should avoid recomputing anything that can safely be reused. Application/context caching and inference/KV caching are different layers and must not be conflated.
 
-- exposes authoritative runtime capabilities;
-- deterministically identifies mandatory context before model reasoning;
-- retrieves current/local/domain data through one data tool;
-- performs controlled actions through one execution tool;
-- feeds observations back into the same model;
-- limits planning and tool calls to what is necessary.
+```text
+Request
+  |
+  v
+Preflight -> cached context -> stable prompt prefix -> prefix/KV cache -> tiny model
+                  ^                                      |
+                  |                                      v
+             data cache <--------- tools <--------- observations
+```
 
-This should be compared with both an untooled tiny model and direct routing to a stronger model.
+Targets:
 
-## 3. Design Principles
+- minimize time-to-first-token (TTFT);
+- minimize prefill work and repeated input tokens;
+- minimize retrieval latency and duplicate retrievals;
+- minimize tool calls and output tokens;
+- maximize context reuse and provider KV/prefix-cache hits;
+- preserve task success while doing so.
 
-Always prefer:
+## 3. Functional architecture
 
-- KISS: simplest implementation that works;
-- YAGNI: no speculative platform features;
-- DRY: consolidate retrieval and execution behind two tools;
-- POLA: predictable tool behavior and explicit runtime constraints.
+The core remains deliberately small:
 
-Additional principles:
+```text
+request
+  -> deterministic preflight
+  -> mandatory context
+  -> tiny model
+  -> get_data / execute
+  -> observation
+  -> verify
+  -> done
+```
 
-- standard library first;
-- minimal dependencies;
-- least privilege;
-- deterministic checks before probabilistic decisions;
-- retrieve authoritative data rather than guessing;
-- verify important actions;
-- stop as soon as the task is complete.
+Core responsibilities are only interpretation, retrieval/action selection, observation and completion.
 
-## 4. Runtime Contract
+## 4. Cross-cutting NFR architecture
 
-The agent receives authoritative runtime metadata.
+Cache, security, audit, telemetry, tracing, rate limits and cost controls must be completely separated from the functional architecture.
+
+### Rule
+
+> NFRs may observe, accelerate, decorate or constrain the functional pipeline, but the core must not depend on their implementations.
+
+Use two small extension mechanisms:
+
+```text
+HOOK  = intercept / allow / deny / replace
+EVENT = observe / record
+```
+
+Examples:
+
+| NFR | Mechanism | Why |
+|---|---|---|
+| Data cache | `before/after` hook | hit can bypass the data adapter |
+| Security | `before` hook | can deny execution |
+| Audit | event sink | observes without changing behavior |
+| Metrics | event sink | measures without core logic |
+| Tracing | event sink | correlation without core dependency |
+| Provider KV cache | model adapter | provider/inference-engine concern |
+| Rate limit | host hook | policy before expensive work |
+
+The core should know only tiny ports/interfaces, never Redis, OpenTelemetry, provider SDKs, databases or security products.
+
+### Desired property
+
+```text
+NFR OFF  -> same functional behavior
+NFR ON   -> same functional behavior + acceleration/controls/observability
+```
+
+If disabling an NFR requires changing the agent algorithm, the separation is wrong.
+
+## 5. Tiny ports
+
+Keep interfaces intentionally small:
+
+```python
+class Model:
+    def generate(self, ...): ...
+
+class DataTool:
+    def get(self, source, query): ...
+
+class Executor:
+    def execute(self, operation, param): ...
+
+class Hook:
+    def before(self, event): ...
+    def after(self, event, result): ...
+
+class EventSink:
+    def publish(self, name, payload): ...
+```
+
+The POC uses callable adapters for model/data/execution and exposes equivalent hook/event contracts in `src/tinyagent.py`.
+
+## 6. Cache architecture
+
+### L1: stable prompt cache
+
+Keep stable system instructions and tool definitions deterministic and before volatile data. Do not place timestamps, request IDs or changing state before the cache boundary.
+
+### L2: reusable context cache
+
+Reuse stable project/session context where safe. Treat context as reusable objects rather than blindly replaying a growing transcript.
+
+Conceptually:
+
+```text
+TASK
+ |- FILE A
+ |- FILE B
+ |- WEB A
+ `- TEST RESULT
+       |
+       v
+    analysis
+```
+
+Each reusable item should have enough identity to detect changes: source, key/path, content/version hash and relevant generation.
+
+### L3: retrieved data cache
+
+`DataCacheHook` provides a small in-process TTL cache around `get_data`.
+
+- file data: invalidate when content/mtime changes;
+- web data: use short TTL according to freshness requirements;
+- domain data: use TTL appropriate to the state being observed.
+
+A cache hit must bypass the underlying data adapter. Cache miss calls the adapter and stores the result.
+
+For multi-tenant use, the cache key must include all relevant security boundaries (tenant/user/project/model/policy context). The cache implementation owns key construction so the functional core remains unaware of identity infrastructure.
+
+### L4: inference prefix/KV cache
+
+The core does not implement provider KV caching. The model adapter should map the stable prefix to the capabilities of the selected inference engine/provider, such as provider prompt caching, vLLM automatic prefix caching or local runtime state.
+
+Expose metrics where available:
+
+```text
+input_tokens
+output_tokens
+cache_read_tokens
+cache_write_tokens
+ttft_ms
+prefill_ms
+decode_ms
+latency_ms
+```
+
+Do not fake a KV-cache abstraction inside TinyAgent. The adapter is the correct boundary.
+
+### L5: safe action/result cache
+
+Optional and later. Read-only deterministic operations may be cached. Mutations must invalidate affected context. Do not cache arbitrary side effects.
+
+## 7. Cache invalidation
+
+The safest POC rule is narrow invalidation:
+
+```text
+edit FILE A
+   -> invalidate FILE A and dependent context
+   -> retain unrelated FILE B / WEB A
+```
+
+A workspace generation/version can cheaply invalidate derived context after mutations without flushing everything. Add it only when evaluation demonstrates mutation-heavy workloads.
+
+## 8. Context ordering for prefix/KV reuse
+
+Use this conceptual order:
+
+```text
+STATIC
+  system prompt
+  tool definitions
+  policies
+  fixed capabilities
+
+SESSION-STABLE
+  project identity
+  stable instructions
+  reusable retrieved context
+
+DYNAMIC
+  current task
+  current time
+  latest observation
+  current tool result
+```
+
+The exact provider API belongs to the model adapter. The important invariant is stable-before-changing.
+
+## 9. Deterministic preflight
+
+Preflight handles decisions that runtime information can establish reliably.
+
+### MUST retrieve web
+
+- latest/current/today/recent/updated requests;
+- post-cutoff dates;
+- current documentation/pricing/releases/vulnerabilities/availability;
+- explicit source requests.
+
+### MUST retrieve file
+
+- explicit local paths/files;
+- repository/codebase tasks;
+- local config/logs/docs/test results required by the task.
+
+### MUST retrieve domain
+
+- deployment status;
+- tickets/issues;
+- cloud resources;
+- production metrics/logs/monitoring;
+- database/application state;
+- connected repository state.
+
+### MAY retrieve
+
+Uncertain facts or supporting context when it materially improves correctness.
+
+### DO NOT retrieve
+
+Information already in context, stable knowledge the model can reliably provide, or unnecessary background.
+
+The model must not answer from stale memory before mandatory web retrieval.
+
+## 10. Runtime contract
+
+The host supplies authoritative values:
 
 ```yaml
 runtime:
   knowledge_cutoff: 2025-06-01
   current_datetime: 2026-09-13T14:30:00+05:30
-  input_modalities:
-    - text
+  input_modalities: [text]
   os: windows
   shell: powershell
   working_directory: C:\repo
 ```
 
-The metadata should be generated by the host, not guessed by the model.
+The model must never claim unsupported capabilities.
 
-The agent must never claim a capability absent from this contract.
-
-## 5. Tools
-
-### get_data
+## 11. Tool contract
 
 ```yaml
-name: get_data
-arguments:
+get_data:
   source: file | web | domain
   query: string
-```
 
-Purpose: retrieve authoritative information required by the task.
-
-`file` means local/project artifacts.
-
-`web` means public/current information.
-
-`domain` means connected enterprise or runtime systems such as GitHub, Jira, cloud APIs, databases, monitoring systems, or internal services.
-
-### execute
-
-```yaml
-name: execute
-arguments:
+execute:
   operation: edit | os | web
   param: string
 ```
 
-Purpose: perform a permitted external action.
+The host owns authorization, sandboxing and resource limits.
 
-The runtime, not the model, owns authorization and policy enforcement.
-
-## 6. Deterministic Preflight
-
-The preflight layer handles decisions that can be made reliably without model reasoning.
-
-### 6.1 Web freshness
-
-Require `get_data(web, ...)` before answering when:
-
-- the user explicitly requests latest/current/today/recent/newest/updated information;
-- the request names a date after the knowledge cutoff;
-- the answer inherently depends on post-cutoff events or versions;
-- current documentation, pricing, availability, regulations, releases, vulnerabilities, or service state is required.
-
-Example:
+## 12. Agent loop
 
 ```text
-cutoff = 2025-06-01
-request = "What changed in .NET in August 2026?"
-
-2026-08 > 2025-06
-=> web retrieval is mandatory
+preflight
+   |
+mandatory retrieval
+   |
+context assembly
+   |
+model decision
+   +---- get_data ----> observation --+
+   |                                  |
+   +---- execute -----> observation --+
+                                      |
+                                  next decision
+                                      |
+                                verify / done
 ```
 
-The model must not answer first and retrieve afterward for these cases.
+The model plans only enough to choose the next useful action.
 
-### 6.2 File state
+## 13. Events
 
-Require `get_data(file, ...)` when the user's task depends on a local artifact, for example:
-
-- explicit file/path references;
-- code in the current repository;
-- local configuration;
-- logs;
-- documents;
-- test results stored locally.
-
-The runtime should retrieve the smallest useful artifact first rather than the whole repository.
-
-### 6.3 Domain state
-
-Require `get_data(domain, ...)` when the answer depends on authoritative external system state, for example:
-
-- issue/ticket status;
-- deployment state;
-- cloud resources;
-- production metrics;
-- monitoring/logging systems;
-- database/application state;
-- repository state when exposed as a connected domain.
-
-Do not use domain retrieval merely because a product or platform name appears in a general conceptual question.
-
-## 7. MUST / MAY / DO NOT Retrieval Policy
-
-### MUST retrieve
-
-- post-cutoff knowledge;
-- explicit current/latest/recent information;
-- required local artifacts;
-- required live/domain state;
-- information explicitly requested from a source.
-
-### MAY retrieve
-
-- uncertain facts;
-- supporting context that materially improves correctness;
-- related artifacts required to understand a retrieved artifact.
-
-### DO NOT retrieve
-
-- information already present in the conversation/context;
-- stable information the model can reliably provide;
-- unnecessary background material.
-
-## 8. Agent Loop
+Keep the event vocabulary small. Suggested events:
 
 ```text
-User request
-    |
-    v
-Deterministic preflight
-    |
-    +--> mandatory get_data calls
-    |
-    v
-Tiny model
-    |
-    +--> get_data --> observe --+
-    |                            |
-    +--> execute --> observe ---+
-    |                            |
-    +----------------------------+
-    |
-    v
-verify when important
-    |
-    v
-answer / stop
+AgentStarted
+AgentCompleted
+AgentFailed
+ContextRequested
+ContextCacheHit
+ContextRetrieved
+ModelRequested
+ModelCompleted
+ExecutionRequested
+ExecutionDenied
+ExecutionCompleted
 ```
 
-The model performs limited planning only. It should select the next necessary action, not construct a long hidden workflow.
+Events should carry metadata, not duplicate large file/web/tool payloads. Store large artifacts separately if needed.
 
-## 9. System Prompt Requirements
+## 14. Security
 
-The base system prompt should instruct the model to:
-
-1. behave as a tiny efficient model;
-2. treat runtime metadata as authoritative;
-3. never invent knowledge, capabilities, tool results, or execution results;
-4. always retrieve post-cutoff/current information through `get_data(web, ...)`;
-5. retrieve local artifacts through `get_data(file, ...)` when needed;
-6. retrieve authoritative live/domain state through `get_data(domain, ...)`;
-7. use `execute` only for necessary permitted actions;
-8. verify important modifications/results;
-9. apply KISS, YAGNI, DRY, and POLA;
-10. prefer standard libraries and existing conventions;
-11. keep planning and output concise;
-12. stop as soon as the task is complete.
-
-## 10. Security Model
-
-Treat model-generated execution parameters as untrusted input.
-
-The host should enforce:
+Security is a pre-action hook, not a model instruction alone:
 
 ```text
 model proposal
-    |
-    v
-policy validation
-    |
-    +--> denied
-    |
-    +--> allowed -> sandboxed execution
+     |
+     v
+security/policy hook
+   /       \
+ deny     allow
+            |
+        sandboxed execute
 ```
 
-Controls should include path allowlists, command allowlists, network policy, timeouts, resource limits, destructive-action restrictions, and audit logging.
+Enforce path and command allowlists, network policy, OS compatibility, destructive-action restrictions, timeouts and resource limits in the host.
 
-## 11. Example Scenarios
+Cache isolation is also a security responsibility: never share sensitive cached data across incompatible security contexts.
 
-### Current knowledge
+## 15. Audit and telemetry
 
-```text
-User: What is the latest OpenAI API change?
+Audit and telemetry consume events. The core must not know where events are stored.
 
-Preflight -> current/latest detected
-        -> get_data(web, ...)
-        -> tiny model synthesizes retrieved result
-```
+A local POC can use an in-memory recorder. Production can connect the same event port to a logging/tracing/metrics backend without modifying TinyAgent.
 
-### Local code
+## 16. Evaluation
 
-```text
-User: Fix src/AuthService.cs
-
-Preflight -> local file referenced
-        -> get_data(file, "src/AuthService.cs")
-        -> tiny model identifies change
-        -> execute(edit, ...)
-        -> verify
-```
-
-### Live domain state
-
-```text
-User: Why did today's production deployment fail?
-
-Preflight -> live environment state required
-        -> get_data(domain, ...)
-        -> tiny model analyzes evidence
-        -> additional retrieval/action only when required
-```
-
-### Modality limitation
-
-```text
-runtime.input_modalities = [text]
-
-User: Analyze this audio file.
-
-Agent must not claim to hear audio.
-It should report the unsupported modality or obtain a supported representation.
-```
-
-## 12. Evaluation Plan
-
-The POC should use a small fixed benchmark covering:
+Benchmark at least:
 
 - static knowledge;
 - post-cutoff knowledge;
 - local file tasks;
-- multi-file code tasks;
-- live domain-state questions;
-- simple edit-and-test tasks;
-- unsupported-modality cases;
-- unsafe/unauthorized execution cases.
-
-Compare:
-
-```text
-A. Tiny model, no tools
-B. Tiny model + get_data
-C. Tiny model + get_data + execute
-D. Strong model, no tools
-E. Tiny agent with deterministic preflight
-F. Model router baseline
-```
+- multi-file tasks;
+- live domain state;
+- edit-and-test;
+- unsupported modalities;
+- denied/unsafe actions;
+- repeated equivalent queries to measure cache reuse;
+- repeated turns with a stable prompt prefix to measure provider KV/prefix reuse.
 
 Measure:
 
-- task success rate;
-- factual accuracy;
-- hallucination rate;
-- tool-call count;
-- tokens consumed;
-- latency;
-- execution failures;
-- cost;
-- unnecessary retrieval rate.
+```text
+Task success
+Accuracy / hallucination
+Tool calls
+Input / output tokens
+Cache-read / cache-write tokens
+Context reuse ratio
+KV cache hit ratio
+Fresh context ratio
+TTFT
+Prefill latency
+Decode latency
+End-to-end latency
+Cost
+Execution failures
+Unnecessary retrieval
+```
 
-## 13. Success Criterion
+Definitions:
 
-The POC is successful if deterministic context acquisition plus two tools improves task completion and factual freshness for tiny models while maintaining materially lower complexity, cost, and latency than simply routing all tasks to a stronger model.
+```text
+Context Reuse Ratio = reused context tokens / total context tokens
+KV Cache Hit Ratio  = cache-read tokens / total input tokens
+Fresh Context Ratio = new context tokens / total context tokens
+```
 
-## 14. Explicit Non-Goals
+The performance goal is not "highest cache hit rate" in isolation. It is lower latency/token cost with unchanged or improved task success and freshness.
 
-Do not add unless evaluation proves they are required:
+## 17. System prompt requirements
 
-- vector database;
+The system prompt should say:
+
+1. you are a tiny efficient agent;
+2. runtime metadata is authoritative;
+3. never invent capabilities/results;
+4. mandatory current/post-cutoff information must be retrieved before answering;
+5. local/domain state must be retrieved when required;
+6. use only the two tools;
+7. execute only permitted necessary actions;
+8. verify important changes;
+9. use KISS/YAGNI/DRY/POLA;
+10. prefer standard libraries and existing conventions;
+11. plan minimally and stop when complete.
+
+## 18. Explicit non-goals for v0
+
+Do not add without measurements:
+
+- Redis/distributed cache;
+- vector DB;
 - long-term memory;
-- separate planner model;
-- critic/reflection model;
+- planner/critic agents;
 - multi-agent orchestration;
 - large tool catalog;
 - workflow DSL;
-- generic agent framework.
+- generic agent framework;
+- provider-specific KV code in the core.
 
-## 15. Future Relationship to TinyRouter
+## 19. Relationship to TinyRouter
 
-TinyRouter answers:
+TinyRouter asks:
 
 ```text
 Which model should handle this request?
 ```
 
-TinyAgent answers:
+TinyAgent asks:
 
 ```text
-What does a small model need to acquire or do to complete this request?
+What does the tiny model need to acquire or do to solve it?
 ```
 
-They can later compose:
-
-```text
-request
-   |
-   v
-TinyAgent
-   |
-   +--> solve with tiny model/tools
-   |
-   +--> cannot solve
-             |
-             v
-         TinyRouter
-             |
-          stronger model
-```
-
-This keeps model escalation as a fallback rather than the first response to every capability gap.
+They can later compose so TinyAgent attempts the cheap path first and TinyRouter escalates only when required.
