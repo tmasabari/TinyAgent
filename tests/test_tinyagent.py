@@ -36,9 +36,9 @@ class TinyAgentTests(unittest.TestCase):
             hooks=(cache,),
             events=events,
         )
-        self.assertEqual(agent.run("hello"), "fresh")
-        self.assertEqual(agent.run("hello"), "fresh")
-        self.assertEqual(calls, ["hello"])
+        self.assertEqual(agent.run("latest Python release"), "fresh")
+        self.assertEqual(agent.run("latest Python release"), "fresh")
+        self.assertEqual(calls, ["latest Python release"])
         self.assertIn("ContextCacheHit", [name for name, _ in events.events])
 
     def test_security_hook_denies_execution(self):
