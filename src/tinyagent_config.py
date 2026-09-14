@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from .tinyagent import PreflightControls
+from tinyagent import PreflightControls
 
 
 @dataclass(frozen=True)

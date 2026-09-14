@@ -146,6 +146,19 @@ def minify_context(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return compact
 
 
+# def _expand_context(context: list[dict[str, Any]]) -> list[dict[str, Any]]:
+#     """Expand compacted context entries back to richer form for local consumption by hooks and models."""
+#     expanded: list[dict[str, Any]] = []
+#     for item in context:
+#         if isinstance(item, dict) and "d" in item and "q" in item:
+#             expanded.append({"tool": "get_data", "source": item.get("d"), "query": item.get("q"), "result": item.get("r")})
+#         elif isinstance(item, dict) and "x" in item and "p" in item:
+#             expanded.append({"tool": "execute", "operation": item.get("x"), "param": item.get("p"), "result": item.get("r")})
+#         else:
+#             expanded.append(dict(item))
+#     return expanded
+
+
 def _hook_before(hooks: tuple[Hook, ...], kind: str, payload: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(h.before(HookContext(kind, payload)) for h in hooks)
 
@@ -231,9 +244,10 @@ class TinyAgent:
             self._event("ContextMinified", before_tokens=before, after_tokens=self._last_minify_tokens)
         system = "\n\n".join(x for x in (self.system_prompt, self.model_system_prompt, runtime_prompt(self.runtime)) if x)
         for _ in range(self.max_iterations):
+            fullcontext: list[dict[str, Any]] = context
             context = self._minify_if_needed(context)
             self._event("ModelRequested")
-            response = self.model(system, request, context)
+            response = self.model(system, request, fullcontext)
             self._event("ModelCompleted")
             if response.get("answer"):
                 self._event("AgentCompleted")

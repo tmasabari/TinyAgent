@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 import json
 from urllib.request import Request, urlopen
 
-from .tinyagent import Runtime, TinyAgent
-from .tinyagent_config import load_config
+from tinyagent import Runtime, TinyAgent
+from tinyagent_config import load_config
 
 
 def call_model(profile, system, request, context):

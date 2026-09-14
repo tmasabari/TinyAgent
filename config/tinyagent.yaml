@@ -39,7 +39,7 @@ preflight:
 models:
   ling-3.0-tiny:
     model: inclusionAI/Ling-3.0-tiny
-    base_url: http://127.0.0.1:8000/v1
+    base_url: http://127.0.0.1:8082/v1
     temperature: 1.0
     top_p: 0.95
     top_k: 20
