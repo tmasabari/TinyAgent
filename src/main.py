@@ -10,21 +10,70 @@ from tinyagent import Runtime, TinyAgent
 from tinyagent_config import load_config
 
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_data",
+            "description": "Retrieve required information. source=file for local artifacts, web for current/public information, domain for authoritative live enterprise state. Return only the minimum useful data.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "enum": ["file", "web", "domain"]},
+                    "query": {"type": "string", "description": "Specific, concise retrieval request."},
+                },
+                "required": ["source", "query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute",
+            "description": "Perform one necessary permitted action. Use only when retrieval cannot complete the task.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["edit", "os", "web"]},
+                    "param": {"type": "string", "description": "Exact action parameter."},
+                },
+                "required": ["operation", "param"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(get_data|execute)\(\s*([\w-]+)\s*,\s*([\"'])(.*?)\3\s*\)\s*</tool_call>", re.S)
 
 
-def parse_model_content(content: str) -> dict:
+def parse_model_message(message: dict) -> dict:
+    if tool_calls := message.get("tool_calls"):
+        function = tool_calls[0].get("function", {})
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+        if function.get("name") == "get_data":
+            return {"get_data": arguments}
+        if function.get("name") == "execute":
+            return {"execute": arguments}
+
+    content = message.get("content", "")
     try:
-        return json.loads(content)
+        value = json.loads(content)
+        if isinstance(value, dict):
+            return value
     except json.JSONDecodeError:
         pass
 
     match = _TOOL_CALL_RE.search(content)
     if match:
         tool, first, param = match.group(1), match.group(2), match.group(4)
-        if tool == "get_data":
-            return {"get_data": {"source": first, "query": param}}
-        return {"execute": {"operation": first, "param": param}}
+        return {tool: {"source" if tool == "get_data" else "operation": first,
+                       "query" if tool == "get_data" else "param": param}}
     return {"answer": content}
 
 
@@ -35,6 +84,9 @@ def call_model(profile, system, request, context):
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps({"request": request, "context": context}, ensure_ascii=False)},
         ],
+        "tools": TOOLS,
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
         "temperature": profile.temperature,
         "top_p": profile.top_p,
         "max_tokens": profile.max_tokens,
@@ -48,9 +100,7 @@ def call_model(profile, system, request, context):
                   headers={"Content-Type": "application/json"}, method="POST")
     with urlopen(req, timeout=300) as response:
         payload = json.load(response)
-    message = payload["choices"][0]["message"]
-    content = message.get("content", "")
-    return parse_model_content(content)
+    return parse_model_message(payload["choices"][0]["message"])
 
 
 def main() -> None:
