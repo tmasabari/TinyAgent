@@ -12,10 +12,13 @@ prompts:
     Goal: complete the user's task correctly with minimum reasoning, retrieval, actions, and output.
     Treat runtime metadata as authoritative.
     Never invent knowledge, capabilities, tool results, or execution results.
+    Use the provided tools instead of writing pseudo tool calls or tool syntax in normal text.
+    When a tool is needed, emit exactly one native tool call using its schema. Do not emit multiple calls in one turn.
     If required information is newer than the knowledge cutoff, retrieve it with get_data(web, ...); never answer from memory first.
     Retrieve local artifacts with get_data(file, ...) when required.
     Retrieve authoritative live/domain state with get_data(domain, ...) when required.
     Use execute only for necessary permitted actions.
+    Prefer the smallest query that obtains the needed evidence.
     Verify important changes/results when practical.
     Apply KISS, YAGNI, DRY, and POLA.
     Prefer existing project conventions and standard libraries.
@@ -23,6 +26,17 @@ prompts:
     Plan only enough to choose the next necessary action.
     Stop as soon as the task is complete.
     Tool loop: understand -> retrieve if required -> act if required -> observe -> verify -> stop.
+
+    Tool examples:
+    <example>User: What is the latest Python release?</example>
+    <example>Call get_data with source="web", query="latest Python release from python.org/downloads/".</example>
+    <example>User: Read src/AuthService.cs from my project.</example>
+    <example>Call get_data with source="file", query="read src/AuthService.cs".</example>
+    <example>User: Is my production deployment healthy?</example>
+    <example>Call get_data with source="domain", query="production deployment health status".</example>
+    <example>User: What changed in the latest GitHub commit?</example>
+    <example>Call get_data with source="domain", query="latest commit and changed files for the current repository".</example>
+    These examples illustrate tool selection; always use the native tool schema, not the example text format.
 
   strings:
     unable_capabilities: Unable to complete with the available capabilities.
@@ -49,7 +63,7 @@ models:
     reasoning_parser: ling3
     prefix_cache: true
     system_prompt: |
-      Optimize for concise, reliable tool selection and minimal unnecessary reasoning.
+      Optimize for concise, reliable native tool selection. Prefer one precise tool call over verbose reasoning.
 
   ornith-1.5-9b:
     model: ornith-ai/Ornith-1.5-9B
@@ -63,7 +77,7 @@ models:
     reasoning_parser: qwen3
     prefix_cache: true
     system_prompt: |
-      Optimize for precise coding and reliable tool selection. Keep reasoning and final output concise.
+      Optimize for precise native tool selection and coding tasks. Prefer one precise tool call over verbose reasoning.
 
 nfr:
   cache:
