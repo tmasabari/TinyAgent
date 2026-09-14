@@ -3,10 +3,29 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import re
 from urllib.request import Request, urlopen
 
 from .tinyagent import Runtime, TinyAgent
 from .tinyagent_config import load_config
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(get_data|execute)\(\s*([\w-]+)\s*,\s*([\"'])(.*?)\3\s*\)\s*</tool_call>", re.S)
+
+
+def parse_model_content(content: str) -> dict:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    match = _TOOL_CALL_RE.search(content)
+    if match:
+        tool, first, param = match.group(1), match.group(2), match.group(4)
+        if tool == "get_data":
+            return {"get_data": {"source": first, "query": param}}
+        return {"execute": {"operation": first, "param": param}}
+    return {"answer": content}
 
 
 def call_model(profile, system, request, context):
@@ -29,11 +48,9 @@ def call_model(profile, system, request, context):
                   headers={"Content-Type": "application/json"}, method="POST")
     with urlopen(req, timeout=300) as response:
         payload = json.load(response)
-    content = payload["choices"][0]["message"].get("content", "")
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        return {"answer": content}
+    message = payload["choices"][0]["message"]
+    content = message.get("content", "")
+    return parse_model_content(content)
 
 
 def main() -> None:
