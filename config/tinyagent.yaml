@@ -1,4 +1,6 @@
-# All tunable prompts, control words and model settings live here.
+# Model-neutral TinyAgent configuration template.
+# Concrete model implementations are selected by evaluation and can be replaced
+# without changing functional requirements.
 
 agent:
   max_iterations: 8
@@ -6,86 +8,103 @@ agent:
     enabled: true
     interval_tokens: 4096
 
-prompts:
-  system: |
-    You are TinyAgent, a small efficient AI agent.
-    Goal: complete the user's task correctly with minimum reasoning, retrieval, actions, and output.
-    Treat runtime metadata as authoritative.
-    Never invent knowledge, capabilities, tool results, or execution results.
-    Use the provided tools instead of writing pseudo tool calls or tool syntax in normal text.
-    When a tool is needed, emit exactly one native tool call using its schema. Do not emit multiple calls in one turn.
-    If required information is newer than the knowledge cutoff, retrieve it with get_data(web, ...); never answer from memory first.
-    Retrieve local artifacts with get_data(file, ...) when required.
-    Retrieve authoritative live/domain state with get_data(domain, ...) when required.
-    Use execute only for necessary permitted actions.
-    Prefer the smallest query that obtains the needed evidence.
-    Verify important changes/results when practical.
-    Apply KISS, YAGNI, DRY, and POLA.
-    Prefer existing project conventions and standard libraries.
-    Do not introduce unnecessary dependencies, abstractions, files, or features.
-    Plan only enough to choose the next necessary action.
-    Stop as soon as the task is complete.
-    Tool loop: understand -> retrieve if required -> act if required -> observe -> verify -> stop.
+decision:
+  enabled: true
+  types: [choice, score, boolean]
+  parallel_independent: true
+  confidence:
+    enabled: true
+    fallback_threshold: 0.70
+    confirm_threshold: 0.50
+    human_threshold: 0.50
 
-    Tool examples:
-    <example>User: What is the latest Python release?</example>
-    <example>Call get_data with source="web", query="latest Python release from python.org/downloads/".</example>
-    <example>User: Read src/AuthService.cs from my project.</example>
-    <example>Call get_data with source="file", query="read src/AuthService.cs".</example>
-    <example>User: Is my production deployment healthy?</example>
-    <example>Call get_data with source="domain", query="production deployment health status".</example>
-    <example>User: What changed in the latest GitHub commit?</example>
-    <example>Call get_data with source="domain", query="latest commit and changed files for the current repository".</example>
-    These examples illustrate tool selection; always use the native tool schema, not the example text format.
+routing:
+  default_role: small-capability
+  roles:
+    decision: decision-model
+    fast: fast-capability
+    small: small-capability
+    medium: medium-capability
+    strong: strong-capability
+    specialist: specialist-capability
+  rules:
+    - when: "privacy == true"
+      action: "local-only"
+    - when: "confidence < configured threshold"
+      action: "fallback"
+    - when: "difficulty requires stronger capability"
+      action: "stronger-role"
+    - when: "task.category == image"
+      action: "specialist-role"
 
-  strings:
-    unable_capabilities: Unable to complete with the available capabilities.
-    unable_limit: Unable to complete within the tool-call limit.
-    execution_denied: execution denied by hook
-    path_outside_root: path outside working directory
+guardrails:
+  prompt_injection_detection: true
+  sensitive_data_detection: true
+  abuse_detection: true
+  policy_violation_detection: true
+
+tool_gating:
+  enabled: true
+  decisions: [allow, confirm, deny]
+  default_on_low_confidence: confirm
+
+batch_decisions:
+  enabled: true
+  max_batch_size: 32
+
+reranking:
+  enabled: true
+
+bulk_labeling:
+  enabled: true
+
+real_time:
+  enabled: true
+  max_decision_latency_ms: 300
+
+evaluation:
+  enabled: true
+  criteria:
+    - quality
+    - latency
+    - throughput
+    - memory
+    - cost
+    - tool_reliability
+    - decision_calibration
+  automatic_role_assignment: false
+
+model_registry:
+  enabled: true
+  model_names_are_configuration_only: true
+
+cache:
+  data:
+    enabled: true
+    ttl_seconds: 300
+  context:
+    enabled: true
+  inference_prefix_kv:
+    delegated_to_model_adapter: true
+  result:
+    enabled: false
+  invalidation:
+    strategy: targeted
 
 preflight:
   current_words: [latest, current, today, now, recent, recently, newest, updated, currently, this week, this month]
   file_phrases: [my code, my project, this file, repository, repo, codebase, local config, local logs]
-  domain_words: [github, jira, azure, aws, deployment, production, logs, metrics, monitoring, ticket, issue, pull request, branch, commit, resource group, lambda, ec2, cloudwatch, database, database state, environment]
+  domain_words: [github, jira, azure, aws, deployment, production, logs, metrics, monitoring, ticket, issue, pull request, branch, commit, resource group, database, environment]
   state_words: [my, our, this, status, running, deployed, configured, failed, failure, logs, metrics, production, environment]
 
-models:
-  ling-3.0-tiny:
-    model: inclusionAI/Ling-3.0-tiny
-    base_url: http://127.0.0.1:8082/v1
-    temperature: 1.0
-    top_p: 0.95
-    top_k: 20
-    max_tokens: 2048
-    thinking: true
-    tool_call_parser: ling3
-    reasoning_parser: ling3
-    prefix_cache: true
-    system_prompt: |
-      Optimize for concise, reliable native tool selection. Prefer one precise tool call over verbose reasoning.
-
-  ornith-1.5-9b:
-    model: ornith-ai/Ornith-1.5-9B
-    base_url: http://127.0.0.1:8000/v1
-    temperature: 0.6
-    top_p: 0.95
-    top_k: 20
-    max_tokens: 2048
-    thinking: true
-    tool_call_parser: qwen3_xml
-    reasoning_parser: qwen3
-    prefix_cache: true
-    system_prompt: |
-      Optimize for precise native tool selection and coding tasks. Prefer one precise tool call over verbose reasoning.
-
 nfr:
-  cache:
-    enabled: true
-    data_ttl_seconds: 300
   security:
     enabled: true
   audit:
     enabled: true
   telemetry:
+    enabled: true
+  health_checks:
+    enabled: true
+  resource_budgets:
     enabled: true
