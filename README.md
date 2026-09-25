@@ -1,106 +1,126 @@
 # TinyAgent
 
-TinyAgent is a minimal agent runtime designed to make small language models useful by giving them just-in-time access to missing knowledge, local state, and controlled actions.
+TinyAgent is a minimal, high-performance agent runtime designed to make small language models useful through just-in-time information acquisition, typed decisions, controlled actions, and aggressive reuse of context and inference state.
 
-> **Do not make a tiny model know everything. Let it retrieve what it needs and act within explicit runtime limits.**
+> **Do not make a tiny model know everything. Let it acquire what it needs, make small typed decisions, and act within explicit runtime limits.**
 
-## Design goals
+## Core design principles
 
-1. **Correctness:** deterministic preflight prevents avoidable stale/context-free answers.
-2. **Performance:** reuse context before recomputing it; maximize provider prefix/KV-cache reuse.
-3. **Simplicity:** two tools, one small loop, standard library first.
-4. **Isolation:** cache, security, audit, telemetry and other NFRs are cross-cutting adapters, not agent logic.
+1. **Decision != Generation != Execution.** Separate fast decisions from answer generation and tool execution.
+2. **Deterministic first.** Use rules whenever the runtime already knows the answer.
+3. **Minimum capable model.** Route to the smallest capability role that can safely perform the task and escalate only when evidence requires it.
+4. **Model-neutral requirements.** Requirements name capability roles, never concrete model names or providers.
+5. **Local-first security.** Sensitive-data decisions and authorization must remain inside the trusted host boundary when no-egress is required.
+6. **Cache first.** Reuse context and inference state before retrieving or recomputing.
+7. **NFR isolation.** Security, caching, audit, telemetry, budgets, and health are cross-cutting hooks/events/adapters.
+8. **KISS + YAGNI + DRY + POLA.** Keep the functional core small and predictable.
 
 ## Architecture
 
 ```text
-                         User request
-                              |
-                              v
-                     deterministic preflight
-                              |
-                    mandatory context retrieval
-                              |
-                  +-----------+-----------+
-                  |       data cache       |  <-- hook
-                  +-----------+-----------+
-                              |
-                              v
-                     TinyAgent core
-                              |
-              +---------------+---------------+
-              |                               |
-           get_data                        execute
-              |                               |
-              +---------------+---------------+
-                              |
-                         observations
-                              |
-                              v
-                         tiny model
-                              |
-                    provider/inference adapter
-                              |
-                       prefix / KV cache
+USER REQUEST
+     |
+     v
+L0 deterministic preflight/rules
+     |
+     +--------------------+
+     | obvious/known case |
+     +---------+----------+
+               | yes
+               v
+          direct route
+               
+               no
+               |
+               v
++---------------------------+
+| DECISION PLANE            |
+| Choice | Score | Boolean |
+| confidence/probabilities  |
++-------------+-------------+
+              |
+              v
++---------------------------+
+| POLICY PLANE              |
+| routing | privacy | risk  |
+| thresholds | budgets      |
++-------------+-------------+
+              |
+              v
++---------------------------+
+| EXECUTION PLANE           |
+| model roles | get_data    |
+| execute | web/domain     |
++-------------+-------------+
+              |
+              v
+        observe / verify
+              |
+              v
+             DONE
 
-       ---------------- cross-cutting NFR plane ----------------
-       security hooks | audit events | telemetry | metrics | tracing
+--------- CROSS-CUTTING NFR PLANE ---------
+security | cache | audit | metrics | tracing
+health | resource budgets | persistence
 ```
 
-The core does **not** import or require cache, audit, security, telemetry, tracing, persistence, or a provider SDK.
+See `docs/tinyagent_poc_context.md` and `docs/decision_architecture.md` for detailed context and diagrams.
 
-### Hooks vs events
+## Nine decision-centric use cases
+
+TinyAgent treats these as reusable decision primitives rather than separate frameworks:
+
+1. **Model routing** — route requests to the minimum capable model role.
+2. **Guardrails** — detect prompt injection, abuse, sensitive data, and policy violations before worker execution.
+3. **Tool-call gating** — classify proposed actions as allow, confirm, or deny.
+4. **Inbox triage** — classify large volumes of messages into configurable operational categories.
+5. **Reranking** — score query/candidate relevance for deterministic ranking.
+6. **LLM evaluation** — score model outputs using typed configurable criteria.
+7. **Bulk labeling** — classify large datasets through batched/map-reduce-style decisions.
+8. **Real-time decisions** — support repeated low-latency decisions in interactive loops.
+9. **Confidence gates** — map confidence to act, confirm, escalate, or human review.
+
+## Decision types
 
 ```text
-Hook  = may this operation proceed / can it be served differently?
-Event = what happened?
+Choice   -> finite alternatives
+Score    -> ordered values
+Boolean  -> binary gates
 ```
 
-- **Cache:** hook around `get_data`; a hit bypasses the underlying data adapter.
-- **Security:** hook before `execute`; denial stops the action.
-- **Audit/telemetry:** event sink observes execution without changing the functional loop.
-- **KV/prefix cache:** owned by the model/provider adapter because only that layer knows the inference engine.
+Independent decisions should run in parallel when the inference backend supports it; dependencies must remain ordered.
 
-NFRs can therefore be disabled without rewriting the agent.
-
-## Cache hierarchy
-
-Performance is a first-class requirement. TinyAgent separates application caching from inference caching:
+## Confidence is a control signal
 
 ```text
-L1  stable prompt prefix       -> provider prompt/KV cache
-L2  reusable context           -> context/data cache
-L3  retrieved file/web/domain  -> DataCacheHook
-L4  inference prefix/KV        -> model adapter / vLLM / llama.cpp / provider
-L5  safe deterministic results -> optional execution adapter cache
+decision + confidence
+          |
+      +---+---+
+      |       |
+     high     low
+      |       |
+      v       v
+    route   fallback / confirm / escalate / human
 ```
 
-The POC implements only the small in-process `DataCacheHook`. It does **not** pretend to implement provider KV caching; the model adapter should expose provider cache metrics such as cache-read tokens, cache-write tokens, TTFT and latency.
+Confidence does not prove semantic correctness; calibration and downstream task outcomes must be measured.
 
-Keep stable prompt material before changing runtime/task data so provider prefix caches can reuse the longest possible prefix. Avoid timestamps, request IDs and other volatile values before the cache boundary.
-
-For multi-tenant systems, cache keys must include the relevant security/tenant/project/model context. The cache adapter owns this concern; the core does not.
-
-Writes should invalidate affected cached context. A simple workspace generation/version is preferable to broad cache flushing once mutation-heavy workloads are measured.
-
-## Runtime context
-
-The host injects authoritative capabilities:
+## Local privacy boundary
 
 ```text
-[RUNTIME]
-knowledge_cutoff=2025-06-01
-current_datetime=2026-09-13T14:30:00+05:30
-input_modalities=text
-os=windows
-shell=powershell
-working_directory=C:\repo
-[/RUNTIME]
+input
+  |
+  v
+LOCAL privacy/security gate
+  |
+ +-- sensitive --> LOCAL ONLY
+ |
+ `-- safe ------> normal routing -> local / cloud / web
 ```
 
-The model must never claim unsupported capabilities.
+A strict no-egress design cannot rely on a cloud decision service for the privacy check because the input would already leave the trusted boundary.
 
-## Two tools
+## Tools
 
 ### `get_data`
 
@@ -108,116 +128,78 @@ The model must never claim unsupported capabilities.
 {"source":"file | web | domain","query":"string"}
 ```
 
-- `file`: local/project artifacts.
-- `web`: public/current information.
-- `domain`: authoritative live enterprise/runtime state.
-
 ### `execute`
 
 ```json
 {"operation":"edit | os | web","param":"string"}
 ```
 
-The model proposes an action. The host policy decides whether it is allowed.
+The model proposes actions; host policy authorizes them.
 
-## Deterministic preflight
+## Cache-first architecture
 
-Require `web` retrieval before model answering for:
+```text
+stable prompt prefix
+        |
+reusable session/context
+        |
+retrieved data cache
+        |
+provider prefix/KV cache
+        |
+safe deterministic result cache
+```
 
-- latest/current/today/recent/updated requests;
-- dates after the knowledge cutoff;
-- inherently current documentation, pricing, releases, vulnerabilities or availability.
+Provider-specific KV/prefix caching stays in the model/inference adapter rather than the functional core.
 
-Require `file` retrieval for required local artifacts and `domain` retrieval for required live state such as deployments, tickets, logs, metrics or cloud resources.
+## Model capability roles
 
-Do not retrieve information already present or unnecessary background.
+```text
+decision-model
+fast-capability
+small-capability
+medium-capability
+strong-capability
+specialist-capability
+```
+
+Concrete implementations are selected by evaluation using quality, latency, throughput, memory, cost, context handling, tool reliability, and decision calibration. A model replacement must not require functional-code changes.
+
+## Configuration
+
+Configuration externalizes routing policy, thresholds, model-role bindings, prompts, guardrails, tool policy, cache policy, evaluation criteria, and NFR settings. Runtime capabilities such as current time, cutoff date, OS, shell, working directory, and modalities remain host-supplied authoritative state.
 
 ## Minimal agent loop
 
 ```text
-understand
-   -> mandatory retrieve
-   -> model chooses next action
-   -> get_data / execute
-   -> observe
-   -> verify important results
-   -> stop
+request
+  -> deterministic preflight
+  -> decision(s)
+  -> policy
+  -> get_data / execute
+  -> observe
+  -> verify when important
+  -> stop
 ```
 
-The model plans only enough to choose the next necessary action.
+The model plans only enough to select the next necessary action.
 
-## Performance rules
+## Performance
 
-1. Preflight mandatory retrievals can run independently in parallel in an async host; do not add async complexity to the core until measured.
-2. Cache semantic/data results separately from model KV/prefix caching.
-3. Keep stable prompt prefixes deterministic.
-4. Retrieve the smallest useful artifact.
-5. Do not summarize small reusable context prematurely; summarization costs tokens and can lose detail.
-6. Compact only when context size becomes a measured bottleneck.
-7. Track cache-read tokens, input/output tokens, TTFT, latency, tool calls and task success.
+Measure decision latency, TTFT, prefill/decode latency, end-to-end latency, throughput, context reuse, KV cache hit rate, tool calls, escalation rate, task success, routing accuracy, calibration, local/cloud cost, and resource usage.
 
-Useful metrics:
+Keep context/prompt prefixes stable, send deltas instead of unchanged state, batch independent decisions, and compact context only when measurement shows it is necessary.
 
-```text
-Context Reuse Ratio = reused context tokens / total context tokens
-KV Cache Hit Ratio  = cache-read tokens / total input tokens
-Fresh Context Ratio = new context tokens / total context tokens
-```
+## Delivery stages
 
-## Security boundary
+**POC:** prove typed decisions, deterministic preflight, routing, confidence fallback, configuration, logging, and benchmarking.
 
-Execution parameters are untrusted model output. Host policy should enforce path/command/network allowlists, OS compatibility, destructive-action restrictions, timeouts and resource limits.
+**MVP:** implement the nine decision-centric use cases plus privacy/security gates, tools, cache/context management, operational fallbacks, health checks, and metrics.
 
-Security belongs in a hook because it can deny an operation. Audit belongs in events because it observes what happened.
+**BETA:** add parallel/dependency-aware decisions, evaluation-driven routing, model registry, adaptive thresholds, batch APIs, large-scale evaluation/labeling/reranking, and bounded autonomous loops.
 
-## Engineering principles
+**FINAL:** add durable/idempotent execution, resource budgets, policy versioning, trust boundaries, secret protection, multi-level caching, hardware-aware execution, continuous benchmarking, and automatic role replacement.
 
-- **KISS** — keep the functional runtime tiny.
-- **YAGNI** — no speculative planner, memory service, vector DB or multi-agent layer.
-- **DRY** — one generic data port and one action port.
-- **POLA** — explicit capabilities and predictable behavior.
+## Non-goals until measurements justify them
 
-## POC evaluation
-
-Compare:
-
-| Case | Model | Tools | Purpose |
-|---|---|---|---|
-| A | Tiny | None | baseline |
-| B | Tiny | `get_data` | context gain |
-| C | Tiny | both | agent gain |
-| D | Strong | None | quality baseline |
-| E | Tiny | deterministic preflight | freshness gain |
-| F | Tiny | cache + hooks/events | performance/NFR isolation |
-| G | Router | Tiny/Strong | routing baseline |
-
-Measure success, accuracy, hallucination, retrieval/tool calls, input/output/cache tokens, TTFT, end-to-end latency, cost, execution failures and unnecessary retrieval.
-
-## Non-goals for v0
-
-Do not add until measurements justify them:
-
-- Redis or another distributed cache;
-- vector database;
-- long-term memory;
-- planner/critic agents;
-- multi-agent orchestration;
-- large tool catalogs;
-- workflow DSL;
-- generic agent framework.
-
-## TinyRouter relationship
-
-TinyRouter asks:
-
-```text
-Which model should handle this request?
-```
-
-TinyAgent asks:
-
-```text
-What does a small model need to acquire or do to complete it?
-```
-
-A future composition can let TinyAgent try the cheap path first and escalate to TinyRouter only when the tiny path cannot solve the task.
+Avoid distributed caches, vector databases, long-term memory, multi-agent orchestration, large tool catalogs, workflow DSLs, and complex planner/critic layers until a measured requirement exists.
